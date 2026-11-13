@@ -11,7 +11,8 @@ class Format(
     val url: String,
     val kind: String,
     val ext: String,
-    val fromMaster: Boolean = false
+    val fromMaster: Boolean = false,
+    val sizeText: String = ""
 )
 
 object St {
@@ -39,6 +40,7 @@ class Task(
     var mime = "video/mp4"
     var segCount = 0
     var rangeOk = false
+    var thumbUrl = ""
     val downloaded = AtomicLong(0)
     val segDone = AtomicInteger(0)
     @Volatile var speed = 0L

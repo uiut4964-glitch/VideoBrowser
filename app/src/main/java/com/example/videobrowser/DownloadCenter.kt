@@ -56,7 +56,7 @@ object DownloadCenter {
                         .put("headers", JSONObject(t.headers))
                         .put("total", t.total).put("parts", t.parts).put("status", t.status)
                         .put("error", t.error).put("savedUri", t.savedUri).put("created", t.created)
-                        .put("mime", t.mime).put("segCount", t.segCount).put("rangeOk", t.rangeOk)
+                        .put("mime", t.mime).put("segCount", t.segCount).put("rangeOk", t.rangeOk).put("thumbUrl", t.thumbUrl)
                 )
             }
             file().writeText(a.toString())
@@ -83,6 +83,7 @@ object DownloadCenter {
                 t.mime = o.optString("mime", "video/mp4")
                 t.segCount = o.optInt("segCount", 0)
                 t.rangeOk = o.optBoolean("rangeOk", false)
+                t.thumbUrl = o.optString("thumbUrl", "")
                 if (t.status == St.QUEUED || t.status == St.DOWNLOADING || t.status == St.MERGING) t.status = St.PAUSED
                 if (t.status != St.DONE) scanTemp(t)
                 tasks.add(t)

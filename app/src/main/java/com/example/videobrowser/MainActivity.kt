@@ -10,15 +10,18 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
@@ -29,24 +32,29 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ProgressBar
+import android.widget.RadioButton
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import org.json.JSONArray
+import com.google.android.material.bottomsheet.BottomSheetBehavior
+import com.google.android.material.bottomsheet.BottomSheetDialog
+import org.json.JSONObject
 import org.json.JSONTokener
+import java.io.File
 import java.net.URL
 import java.net.URLEncoder
 import java.util.UUID
@@ -56,9 +64,21 @@ import kotlin.math.abs
 private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
+// يبحث عن الفيديو الذي يُشغَّل فعليًا (الأكبر ظهورًا على الشاشة) ويتجاهل المعاينات
 private const val SCAN_JS =
-    "(function(){var r=[];document.querySelectorAll('video,audio,source').forEach(function(e){" +
-        "var s=e.currentSrc||e.src;if(s)r.push(s);});return JSON.stringify(r);})()"
+    "(function(){var vs=document.querySelectorAll('video'),best=null,bs=-1,others=[];" +
+        "var vw=window.innerWidth,vh=window.innerHeight;" +
+        "for(var i=0;i<vs.length;i++){var v=vs[i];if(!v.__vid)v.__vid=Math.random().toString(36).slice(2);" +
+        "var s0=v.currentSrc||v.src||'';var r=v.getBoundingClientRect();" +
+        "var w=Math.max(0,Math.min(r.right,vw)-Math.max(r.left,0));" +
+        "var h=Math.max(0,Math.min(r.bottom,vh)-Math.max(r.top,0));var area=w*h;" +
+        "var playing=!v.paused&&!v.ended&&v.readyState>2;" +
+        "if(area<1||(!playing&&!(v.currentTime>1))){if(s0)others.push(s0);continue;}" +
+        "var sc=area*(playing?4:1)*(v.muted?1:2);" +
+        "if(sc>bs){if(best&&best.src)others.push(best.src);bs=sc;best={id:v.__vid,src:s0,poster:v.poster||''};}" +
+        "else if(s0)others.push(s0);}" +
+        "var og=document.querySelector('meta[property=\"og:image\"]');" +
+        "return JSON.stringify({n:vs.length,a:best,o:others,og:og?og.content:''});})()"
 
 private const val DESKTOP_UA =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -73,8 +93,13 @@ class MainActivity : AppCompatActivity() {
     private class Tab(val web: WebView) {
         var title = "علامة تبويب جديدة"
         var url = ""
+        var pending = false
         val media = LinkedHashMap<String, MediaItem>()
+        val sniffed = LinkedHashMap<String, Long>()
         var sawBlob = false
+        var activeId: String? = null
+        var playStart = 0L
+        var poster = ""
     }
 
     private val tabs = ArrayList<Tab>()
@@ -86,17 +111,33 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fabIcon: ImageView
     private lateinit var badge: TextView
     private lateinit var tabBtn: TextView
+    private lateinit var backItem: View
+    private lateinit var fwdItem: View
     private val io = Executors.newCachedThreadPool()
     private val ui = Handler(Looper.getMainLooper())
     private var customView: View? = null
     private var customCb: WebChromeClient.CustomViewCallback? = null
     private var desktop = false
     private lateinit var defaultUa: String
+    private var pathView: TextView? = null
+
+    private val pickFolder = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+        if (uri != null) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (e: Exception) {
+            }
+            Prefs.setFolder(this, uri.toString())
+            pathView?.text = pathText()
+        }
+    }
 
     private val scanLoop = object : Runnable {
         override fun run() {
             cur?.let { scan(it) }
-            ui.postDelayed(this, 2500)
+            ui.postDelayed(this, 1000)
         }
     }
 
@@ -112,7 +153,7 @@ class MainActivity : AppCompatActivity() {
         }
         setContentView(buildUi())
         CookieManager.getInstance().setAcceptCookie(true)
-        newTab(intent?.data?.toString() ?: Prefs.home(this))
+        restoreTabs(intent?.data?.toString())
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -123,6 +164,7 @@ class MainActivity : AppCompatActivity() {
                 else finish()
             }
         })
+        showLastCrash()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -138,37 +180,67 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         ui.removeCallbacks(scanLoop)
+        saveTabs()
         super.onPause()
+    }
+
+    override fun onStop() {
+        saveTabs()
+        super.onStop()
     }
 
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
+        content.removeAllViews()
         tabs.forEach { it.web.destroy() }
         super.onDestroy()
     }
 
+    // ---------------------------------------------------------------- حفظ واسترجاع التبويبات
+    private fun saveTabs() {
+        val kept = tabs.filter { it.url.startsWith("http") }
+        if (kept.isEmpty()) return
+        Store.put(this, "tabs", kept.map { it.title to it.url })
+        getSharedPreferences("state", Context.MODE_PRIVATE).edit()
+            .putInt("cur", kept.indexOf(cur).coerceAtLeast(0)).apply()
+    }
+
+    private fun restoreTabs(start: String?) {
+        val saved = Store.get(this, "tabs")
+        if (saved.isEmpty()) {
+            newTab(start ?: Prefs.home(this))
+            return
+        }
+        val idx = getSharedPreferences("state", Context.MODE_PRIVATE).getInt("cur", 0)
+        for (p in saved) newTab(p.second, false, p.first)
+        selectTab(tabs[idx.coerceIn(0, tabs.size - 1)])
+        if (start != null) newTab(start)
+    }
+
+    private fun showLastCrash() {
+        val f = File(filesDir, "crash.txt")
+        if (!f.exists()) return
+        val txt = try { f.readText() } catch (e: Exception) { return }
+        val sv = ScrollView(this)
+        sv.addView(TextView(this).apply { text = txt; textSize = 10f; setPadding(dp(16), dp(8), dp(16), dp(8)); setTextIsSelectable(true) })
+        AlertDialog.Builder(this)
+            .setTitle("حدث خطأ في التشغيل السابق")
+            .setView(sv)
+            .setPositiveButton("نسخ") { _, _ ->
+                (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                    .setPrimaryClip(ClipData.newPlainText("crash", txt))
+                f.delete()
+            }
+            .setNegativeButton("إغلاق") { _, _ -> f.delete() }
+            .show()
+    }
+
     // ---------------------------------------------------------------- واجهة المستخدم
-    private fun circle(color: Int) = GradientDrawable().apply {
-        shape = GradientDrawable.OVAL
-        setColor(color)
-    }
-
-    private fun rounded(color: Int, r: Int, stroke: Int = 0) = GradientDrawable().apply {
-        cornerRadius = dp(r).toFloat()
-        setColor(color)
-        if (stroke != 0) setStroke(dp(1), stroke)
-    }
-
-    private fun barButton(text: String, onClick: (View) -> Unit) = TextView(this).apply {
-        this.text = text
-        textSize = 20f
-        gravity = Gravity.CENTER
-        setTextColor(0xFF37474F.toInt())
-        setOnClickListener { onClick(it) }
-    }
+    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
 
     @SuppressLint("ClickableViewAccessibility")
     private fun buildUi(): View {
+        val dark = 0xFF455A64.toInt()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.WHITE)
@@ -178,18 +250,18 @@ class MainActivity : AppCompatActivity() {
         val top = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8), dp(6), dp(8), dp(6))
+            setPadding(dp(8), dp(6), dp(4), dp(6))
             setBackgroundColor(0xFFF1F3F4.toInt())
         }
         tabBtn = TextView(this).apply {
             text = "1"
             gravity = Gravity.CENTER
-            setTextColor(0xFF37474F.toInt())
+            textSize = 13f
+            setTextColor(dark)
             background = rounded(Color.WHITE, 6, 0xFF607D8B.toInt())
             setOnClickListener { showTabs() }
         }
-        top.addView(tabBtn, LinearLayout.LayoutParams(dp(32), dp(32)))
-
+        top.addView(tabBtn, LinearLayout.LayoutParams(dp(30), dp(30)))
         urlBar = EditText(this).apply {
             hint = "ابحث أو اكتب رابط URL"
             setSingleLine()
@@ -205,11 +277,11 @@ class MainActivity : AppCompatActivity() {
                 true
             }
         }
-        top.addView(urlBar, LinearLayout.LayoutParams(0, dp(42), 1f).apply {
-            marginStart = dp(8); marginEnd = dp(4)
-        })
-        top.addView(barButton("⟳") { cur?.web?.reload() }, LinearLayout.LayoutParams(dp(36), dp(36)))
-        top.addView(barButton("⋮") { showMenu(it) }, LinearLayout.LayoutParams(dp(36), dp(36)))
+        top.addView(urlBar, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginStart = dp(8); marginEnd = dp(2) })
+        top.addView(iconBtn(R.drawable.ic_refresh, dark, 9).apply { setOnClickListener { cur?.web?.reload() } },
+            LinearLayout.LayoutParams(dp(40), dp(40)))
+        top.addView(iconBtn(R.drawable.ic_more, dark, 8).apply { setOnClickListener { showMenu(it) } },
+            LinearLayout.LayoutParams(dp(40), dp(40)))
         root.addView(top, LinearLayout.LayoutParams(MATCH, WRAP))
 
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -262,29 +334,40 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
+        // الشريط السفلي
+        root.addView(View(this).apply { setBackgroundColor(0xFFDADCE0.toInt()) }, LinearLayout.LayoutParams(MATCH, dp(1)))
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(0xFFF1F3F4.toInt())
+            setBackgroundColor(Color.WHITE)
         }
-        fun item(text: String, onClick: () -> Unit) {
-            val tv = TextView(this).apply {
-                this.text = text
-                textSize = 13f
+        fun nav(res: Int, label: String, onClick: () -> Unit): View {
+            val c = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
-                setTextColor(0xFF37474F.toInt())
+                setBackgroundResource(ripple())
                 setOnClickListener { onClick() }
             }
-            bottom.addView(tv, LinearLayout.LayoutParams(0, dp(48), 1f))
+            c.addView(ImageView(this).apply { setImageResource(res); setColorFilter(dark) }, LinearLayout.LayoutParams(dp(24), dp(24)))
+            c.addView(TextView(this).apply {
+                text = label; textSize = 10.5f; gravity = Gravity.CENTER; setTextColor(dark)
+            }, LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(2) })
+            bottom.addView(c, LinearLayout.LayoutParams(0, dp(54), 1f))
+            return c
         }
-        item("رجوع") { val t = cur; if (t != null && t.web.canGoBack()) t.web.goBack() }
-        item("أمام") { val t = cur; if (t != null && t.web.canGoForward()) t.web.goForward() }
-        item("الرئيسية") { cur?.web?.loadUrl(Prefs.home(this)) }
-        item("التحميلات") { startActivity(Intent(this, DownloadsActivity::class.java)) }
+        backItem = nav(R.drawable.ic_back, "رجوع") { val t = cur; if (t != null && t.web.canGoBack()) t.web.goBack() }
+        fwdItem = nav(R.drawable.ic_forward, "أمام") { val t = cur; if (t != null && t.web.canGoForward()) t.web.goForward() }
+        nav(R.drawable.ic_home, "الرئيسية") { cur?.web?.loadUrl(Prefs.home(this)) }
+        nav(R.drawable.ic_tabs, "التبويبات") { showTabs() }
+        nav(R.drawable.ic_download, "التحميلات") { startActivity(Intent(this, DownloadsActivity::class.java)) }
         root.addView(bottom, LinearLayout.LayoutParams(MATCH, WRAP))
         return root
     }
 
-    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+    private fun updateNav() {
+        val t = cur
+        backItem.alpha = if (t != null && t.web.canGoBack()) 1f else 0.35f
+        fwdItem.alpha = if (t != null && t.web.canGoForward()) 1f else 0.35f
+    }
 
     private fun updateFab() {
         val n = cur?.media?.size ?: 0
@@ -296,13 +379,20 @@ class MainActivity : AppCompatActivity() {
     // ---------------------------------------------------------------- التبويبات
     private fun tabOf(w: WebView): Tab? = tabs.firstOrNull { it.web === w }
 
-    private fun newTab(url: String?) {
+    private fun newTab(url: String?, load: Boolean = true, title: String = "") {
         val w = WebView(this)
         setupWebView(w)
         val t = Tab(w)
         tabs.add(t)
-        selectTab(t)
-        if (url != null) w.loadUrl(url)
+        if (load) {
+            selectTab(t)
+            if (url != null) w.loadUrl(url)
+        } else {
+            t.url = url ?: ""
+            if (title.isNotEmpty()) t.title = title
+            t.pending = true
+        }
+        tabBtn.text = tabs.size.toString()
     }
 
     private fun selectTab(t: Tab) {
@@ -310,10 +400,15 @@ class MainActivity : AppCompatActivity() {
         cur = t
         t.web.onResume()
         content.addView(t.web, 0, FrameLayout.LayoutParams(MATCH, MATCH))
+        if (t.pending) {
+            t.pending = false
+            t.web.loadUrl(t.url)
+        }
         urlBar.setText(t.url)
         tabBtn.text = tabs.size.toString()
         progress.visibility = View.GONE
         updateFab()
+        updateNav()
     }
 
     private fun closeTab(t: Tab) {
@@ -382,21 +477,26 @@ class MainActivity : AppCompatActivity() {
                 val t = tabOf(v) ?: return
                 t.url = url
                 t.media.clear()
+                t.sniffed.clear()
+                t.activeId = null
                 t.sawBlob = false
-                if (t === cur) { urlBar.setText(url); updateFab() }
+                t.poster = ""
+                if (t === cur) { urlBar.setText(url); updateFab(); updateNav() }
             }
 
             override fun onPageFinished(v: WebView, url: String) {
                 val t = tabOf(v) ?: return
+                t.url = url
                 t.title = v.title ?: url
                 addHistory(t.title, url)
+                if (t === cur) updateNav()
                 scan(t)
             }
 
             override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest): WebResourceResponse? {
                 val u = r.url.toString()
                 if (MEDIA_REGEX.containsMatchIn(u) || u.contains("videoplayback")) {
-                    ui.post { tabOf(v)?.let { addMedia(it, u, false) } }
+                    ui.post { tabOf(v)?.let { rec(it, u) } }
                 }
                 return null
             }
@@ -426,14 +526,15 @@ class MainActivity : AppCompatActivity() {
             override fun onHideCustomView() { hideCustom() }
         }
 
-        w.setDownloadListener { url, _, cd, mime, _ ->
+        w.setDownloadListener { url, _, cd, mime, len ->
             if (url.startsWith("blob:") || url.startsWith("data:")) {
                 toast("هذا النوع من الروابط لا يمكن تحميله مباشرة")
             } else {
                 val fname = URLUtil.guessFileName(url, cd, mime)
                 val ext = fname.substringAfterLast('.', "bin")
                 val t = cur
-                askName(Format("", "", url, "direct", ext), if (t != null) headersFor(t, w) else emptyMap(), fname.substringBeforeLast('.'))
+                val f = Format("الملف", "", url, "direct", ext, false, if (len > 0) Util.fmtSize(len) else "")
+                showFormatSheet(listOf(f), if (t != null) headersFor(t, w) else emptyMap(), fname.substringBeforeLast('.'), "")
             }
         }
     }
@@ -455,32 +556,65 @@ class MainActivity : AppCompatActivity() {
         Store.put(this, "history", l)
     }
 
-    // ---------------------------------------------------------------- كشف الفيديو
+    // ---------------------------------------------------------------- كشف الفيديو الذي يُشغَّل فعليًا
+    private fun rec(t: Tab, url: String) {
+        if (t.sniffed.containsKey(url)) return
+        t.sniffed[url] = System.currentTimeMillis()
+        if (t.sniffed.size > 80) t.sniffed.remove(t.sniffed.keys.first())
+    }
+
+    private fun addTo(t: Tab, url: String) {
+        t.media[url] = MediaItem(url, if (url.contains(".m3u8", true)) "hls" else "direct")
+    }
+
     private fun scan(t: Tab) {
+        if (t.pending) return
         t.web.evaluateJavascript(SCAN_JS) { r ->
             try {
                 if (r != null && r != "null") {
                     val s = JSONTokener(r).nextValue() as? String
-                    if (s != null) {
-                        val arr = JSONArray(s)
-                        for (i in 0 until arr.length()) {
-                            val u = arr.getString(i)
-                            if (u.startsWith("blob:")) t.sawBlob = true
-                            else if (u.startsWith("http")) addMedia(t, u, true)
-                        }
-                    }
+                    if (s != null) onScan(t, JSONObject(s))
                 }
             } catch (e: Exception) {
             }
         }
     }
 
-    private fun addMedia(t: Tab, url: String, fromDom: Boolean) {
-        if (t.media.containsKey(url)) return
-        if (!fromDom && !MEDIA_REGEX.containsMatchIn(url) && !url.contains("videoplayback")) return
-        val type = if (url.contains(".m3u8", true)) "hls" else "direct"
-        t.media[url] = MediaItem(url, type)
-        if (t === cur) updateFab()
+    private fun onScan(t: Tab, o: JSONObject) {
+        val n = o.optInt("n")
+        val a = o.optJSONObject("a")
+        val others = HashSet<String>()
+        val oa = o.optJSONArray("o")
+        if (oa != null) for (i in 0 until oa.length()) others.add(oa.getString(i))
+
+        if (a == null) {
+            t.activeId = null
+            t.media.clear()
+            if (n == 0) {
+                // لا يوجد عنصر فيديو في الصفحة نفسها (قد يكون داخل iframe): نعرض آخر ما التُقط حديثًا
+                val now = System.currentTimeMillis()
+                for ((u, ts) in t.sniffed) if (now - ts < 90000) addTo(t, u)
+            }
+            updateFab()
+            return
+        }
+        val id = a.getString("id")
+        if (id != t.activeId) {
+            t.activeId = id
+            t.playStart = System.currentTimeMillis()
+        }
+        val src = a.optString("src")
+        t.poster = a.optString("poster").ifEmpty { o.optString("og") }
+        t.media.clear()
+        if (src.startsWith("http")) {
+            addTo(t, src)
+        } else {
+            if (src.startsWith("blob:")) t.sawBlob = true
+            val cand = t.sniffed.filter { !others.contains(it.key) }
+            val recent = cand.filter { it.value >= t.playStart - 5000 }
+            for (u in (if (recent.isNotEmpty()) recent else cand).keys) addTo(t, u)
+        }
+        updateFab()
     }
 
     private fun headersFor(t: Tab, w: WebView = t.web): Map<String, String> {
@@ -501,15 +635,16 @@ class MainActivity : AppCompatActivity() {
         val t = cur ?: return
         if (t.media.isEmpty()) {
             toast(
-                if (t.sawBlob) "هذا الموقع يستخدم بثًا محميًا (blob) لا يمكن تحميله مباشرة"
-                else "لم يتم العثور على فيديو في هذه الصفحة. شغّل الفيديو أولًا ثم حاول مرة أخرى"
+                if (t.sawBlob) "هذا الموقع يستخدم بثًا محميًا لا يمكن تحميله مباشرة"
+                else "لم أجد فيديو قيد التشغيل. شغّل الفيديو الذي تريده أولًا ثم اضغط الزر"
             )
             return
         }
         toast("جارٍ جلب الصيغ المتاحة...")
         val items = t.media.values.toList()
         val headers = headersFor(t)
-        val title = t.title
+        val title = if (t.title.isBlank()) Util.host(t.url) else t.title
+        val poster = t.poster
         io.execute {
             val list = ArrayList<Format>()
             for (item in items) {
@@ -519,47 +654,155 @@ class MainActivity : AppCompatActivity() {
                 .distinctBy { it.url }
             ui.post {
                 if (isFinishing) return@post
-                if (clean.isEmpty()) toast("تعذر جلب معلومات الفيديو") else showFormats(clean, headers, title)
+                if (clean.isEmpty()) toast("تعذر جلب معلومات الفيديو") else showFormatSheet(clean, headers, title, poster)
             }
         }
     }
 
-    private fun showFormats(list: List<Format>, headers: Map<String, String>, title: String) {
-        val ad = object : ArrayAdapter<Format>(this, android.R.layout.simple_list_item_2, android.R.id.text1, list) {
-            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-                val v = super.getView(position, convertView, parent)
-                val f = getItem(position)!!
-                v.findViewById<TextView>(android.R.id.text1).text = f.label
-                v.findViewById<TextView>(android.R.id.text2).text = f.details
-                return v
+    // ---------------------------------------------------------------- شاشة اختيار الجودة
+    private fun pathText(): String {
+        val f = Prefs.folder(this)
+        return "المسار: " + (if (f == null) "Download/VideoBrowser" else (Uri.parse(f).lastPathSegment ?: f))
+    }
+
+    private fun showFormatSheet(list: List<Format>, headers: Map<String, String>, title: String, poster: String) {
+        val dlg = BottomSheetDialog(this)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(12))
+            setBackgroundColor(Color.WHITE)
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+
+        // الرأس: صورة مصغرة + اسم الملف
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val thumb = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER
+            setImageResource(R.drawable.ic_video)
+            setColorFilter(0xFF90A4AE.toInt())
+            background = rounded(0xFFECEFF1.toInt(), 8)
+            clipToOutline = true
+            outlineProvider = ViewOutlineProvider.BACKGROUND
+        }
+        val et = EditText(this).apply {
+            setText(title)
+            textSize = 14f
+            maxLines = 3
+        }
+        head.addView(thumb, LinearLayout.LayoutParams(dp(110), dp(70)))
+        head.addView(et, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(10) })
+        root.addView(head)
+        if (poster.startsWith("http")) {
+            ThumbLoader.loadUrl(poster, headers) { b ->
+                if (b != null) {
+                    thumb.clearColorFilter()
+                    thumb.scaleType = ImageView.ScaleType.CENTER_CROP
+                    thumb.setImageBitmap(b)
+                }
             }
         }
-        AlertDialog.Builder(this)
-            .setTitle("اختر جودة التحميل")
-            .setAdapter(ad) { _, which -> askName(list[which], headers, title) }
-            .setNegativeButton("إلغاء", null)
-            .show()
-    }
 
-    private fun askName(f: Format, headers: Map<String, String>, title: String) {
-        val et = EditText(this).apply { setText(Util.safeName(title) + "." + f.ext) }
-        val box = FrameLayout(this).apply {
-            setPadding(dp(20), dp(8), dp(20), 0)
-            addView(et)
+        // المسار
+        val prow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val pv = TextView(this).apply {
+            text = pathText(); textSize = 12f; setTextColor(0xFF607D8B.toInt())
+            maxLines = 1; ellipsize = TextUtils.TruncateAt.END
         }
-        AlertDialog.Builder(this)
-            .setTitle("اسم الملف")
-            .setView(box)
-            .setPositiveButton("تحميل") { _, _ -> startDownload(f, et.text.toString(), headers) }
-            .setNegativeButton("إلغاء", null)
-            .show()
+        pathView = pv
+        prow.addView(pv, LinearLayout.LayoutParams(0, WRAP, 1f))
+        prow.addView(TextView(this).apply {
+            text = "تغيير"; textSize = 13f; setTextColor(0xFF1565C0.toInt())
+            setPadding(dp(10), dp(8), dp(4), dp(8))
+            setOnClickListener { pickFolder.launch(null) }
+        })
+        root.addView(prow, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(6) })
+        root.addView(View(this).apply { setBackgroundColor(0xFFE0E0E0.toInt()) }, LinearLayout.LayoutParams(MATCH, dp(1)))
+
+        // قائمة الصيغ
+        var selected: Format? = null
+        val boxes = ArrayList<Pair<RadioButton, Format>>()
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        var rows = 0
+        var sections = 0
+        fun section(text: String, color: Int) {
+            sections++
+            box.addView(TextView(this).apply {
+                this.text = text; textSize = 14f; setTextColor(color)
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setPadding(dp(4), dp(12), dp(4), dp(4))
+            })
+        }
+        fun row(f: Format) {
+            rows++
+            val rb = RadioButton(this).apply { isClickable = false; isFocusable = false }
+            val r = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(2), dp(6), dp(2), dp(6))
+                setBackgroundResource(ripple())
+            }
+            r.addView(rb)
+            r.addView(TextView(this).apply { text = f.label; textSize = 15f; setTextColor(Color.BLACK) },
+                LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(6) })
+            r.addView(TextView(this).apply {
+                text = if (f.kind == "hls") "HLS" else f.ext.uppercase()
+                textSize = 13f; gravity = Gravity.CENTER; setTextColor(0xFF607D8B.toInt())
+            }, LinearLayout.LayoutParams(dp(56), WRAP))
+            r.addView(TextView(this).apply {
+                text = f.sizeText; textSize = 13f; gravity = Gravity.CENTER_VERTICAL or Gravity.END
+                setTextColor(0xFF607D8B.toInt())
+            }, LinearLayout.LayoutParams(dp(92), WRAP))
+            r.setOnClickListener {
+                selected = f
+                boxes.forEach { it.first.isChecked = it.second === f }
+            }
+            boxes.add(rb to f)
+            box.addView(r)
+        }
+        val video = list.filter { !Formats.isAudio(it.ext) }
+        val audio = list.filter { Formats.isAudio(it.ext) }
+        if (video.isNotEmpty()) { section("الفيديو", 0xFFE53935.toInt()); video.forEach { row(it) } }
+        if (audio.isNotEmpty()) { section("الصوت", 0xFF8E24AA.toInt()); audio.forEach { row(it) } }
+        boxes.firstOrNull()?.let { it.first.isChecked = true; selected = it.second }
+
+        val sv = ScrollView(this)
+        sv.addView(box)
+        val maxH = (resources.displayMetrics.heightPixels * 0.42).toInt()
+        val wantH = rows * dp(50) + sections * dp(40) + dp(8)
+        root.addView(sv, LinearLayout.LayoutParams(MATCH, minOf(wantH, maxH)))
+
+        // زر التحميل
+        val btn = TextView(this).apply {
+            text = "تحميل"
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = rounded(0xFFE53935.toInt(), 8)
+            setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_download, 0, 0, 0)
+            compoundDrawablePadding = dp(8)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setOnClickListener {
+                val f = selected
+                if (f != null) {
+                    dlg.dismiss()
+                    startDownload(f, et.text.toString(), headers, poster)
+                }
+            }
+        }
+        root.addView(btn, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(10) })
+
+        dlg.setContentView(root)
+        dlg.setOnDismissListener { pathView = null }
+        dlg.behavior.state = BottomSheetBehavior.STATE_EXPANDED
+        dlg.show()
     }
 
-    private fun startDownload(f: Format, n: String, headers: Map<String, String>) {
+    private fun startDownload(f: Format, n: String, headers: Map<String, String>, poster: String) {
         var name = Util.safeName(n)
-        if (!name.contains('.')) name += "." + f.ext
+        if (!name.contains('.') || name.substringAfterLast('.').length > 5) name += "." + f.ext
         val t = Task(UUID.randomUUID().toString(), f.url, name, f.kind, headers)
         t.mime = Util.mimeOf(name)
+        t.thumbUrl = poster
         DownloadCenter.add(t)
         toast("بدأ التحميل — تابعه من زر (التحميلات)")
     }

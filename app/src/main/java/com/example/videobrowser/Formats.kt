@@ -5,6 +5,8 @@ import java.util.Locale
 object Formats {
     private val exts = setOf("mp4", "m4v", "webm", "mkv", "mov", "flv", "3gp", "mp3", "m4a", "aac", "ogg", "wav")
 
+    fun isAudio(ext: String): Boolean = ext in setOf("mp3", "m4a", "aac", "ogg", "wav")
+
     fun extOf(url: String, mime: String): String {
         val path = url.substringBefore('?').substringBefore('#')
         val e = path.substringAfterLast('.', "").lowercase()
@@ -24,18 +26,19 @@ object Formats {
             if (Hls.isMaster(text)) {
                 for (v in Hls.parseMaster(text, item.url).sortedByDescending { it.bandwidth }) {
                     val d = ArrayList<String>()
+                    var est = ""
                     if (v.resolution.isNotEmpty()) d.add(v.resolution)
                     if (v.bandwidth > 0) d.add(String.format(Locale.US, "%.1f Mbps", v.bandwidth / 1_000_000.0))
                     try {
                         val m = Hls.parseMedia(Net.fetchText(v.url, h), v.url)
                         if (m.duration > 0) {
                             d.add(Util.fmtDur(m.duration))
-                            if (v.bandwidth > 0) d.add("≈ " + Util.fmtSize((v.bandwidth / 8 * m.duration).toLong()))
+                            if (v.bandwidth > 0) est = "≈ " + Util.fmtSize((v.bandwidth / 8 * m.duration).toLong())
                         }
                     } catch (e: Exception) {
                     }
                     val q = if (v.resolution.contains('x')) v.resolution.substringAfter('x') + "p" else "جودة"
-                    out.add(Format("$q • HLS", d.joinToString(" • "), v.url, "hls", "ts", true))
+                    out.add(Format(q, d.joinToString(" • "), v.url, "hls", "ts", true, est))
                 }
             } else {
                 val m = Hls.parseMedia(text, item.url)
@@ -57,13 +60,12 @@ object Formats {
             val ext = extOf(item.url, p.mime)
             val q = Regex("(\\d{3,4})[pP](?![a-zA-Z])").find(item.url)?.groupValues?.get(1)
             val d = ArrayList<String>()
-            d.add(Util.fmtSize(p.total))
             d.add(Util.host(item.url))
             d.add(if (p.rangeOk) "يدعم التجزئة والاستئناف" else "بدون تجزئة/استئناف")
             out.add(
                 Format(
-                    (if (q != null) "${q}p • " else "") + ext.uppercase(),
-                    d.joinToString(" • "), item.url, "direct", ext
+                    if (q != null) "${q}p" else if (isAudio(ext)) "صوت" else "الجودة الأصلية",
+                    d.joinToString(" • "), item.url, "direct", ext, false, Util.fmtSize(p.total)
                 )
             )
         }

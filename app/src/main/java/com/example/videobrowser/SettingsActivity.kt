@@ -17,6 +17,11 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import android.net.Uri
+import android.provider.Settings
+import android.app.ActivityManager
+import java.io.File
+import java.text.DateFormat
+import java.util.Date
 
 class SettingsActivity : AppCompatActivity() {
     private lateinit var box: LinearLayout
@@ -129,6 +134,17 @@ class SettingsActivity : AppCompatActivity() {
             Prefs.setWifiOnly(this, !Prefs.wifiOnly(this)); render()
         }
 
+
+        add("العمل في الخلفية", "اسمح للتطبيق بتجاهل توفير البطارية حتى لا يُغلق وهو في الخلفية") {
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (e: Exception) {
+                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + packageName)))
+            }
+        }
+
+        add("تشخيص: سبب آخر إغلاق للتطبيق", "اضغط لعرض السبب") { showExitReason() }
+
         add("مسح السجل", "حذف سجل التصفح") {
             Store.put(this, "history", emptyList())
             Toast.makeText(this, "تم مسح السجل", Toast.LENGTH_SHORT).show()
@@ -138,5 +154,36 @@ class SettingsActivity : AppCompatActivity() {
             CookieManager.getInstance().removeAllCookies(null)
             Toast.makeText(this, "تم المسح", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun showExitReason() {
+        val sb = StringBuilder()
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            val am = getSystemService(ActivityManager::class.java)
+            val list = am.getHistoricalProcessExitReasons(packageName, 0, 3)
+            if (list.isEmpty()) sb.append("لا توجد سجلات إغلاق.\n")
+            for (r in list) {
+                val why = when (r.reason) {
+                    1 -> "أغلق التطبيق نفسه"
+                    2 -> "أنهاه النظام (غالبًا توفير الذاكرة أو البطارية)"
+                    3 -> "نفاد الذاكرة: أغلقه النظام ليحرر مساحة"
+                    4 -> "انهيار بسبب خطأ برمجي"
+                    5 -> "انهيار في مكتبة النظام"
+                    6 -> "التطبيق لم يعد يستجيب"
+                    9 -> "استهلاك مفرط للموارد"
+                    10, 11 -> "أغلقه المستخدم"
+                    14 -> "تجميد التطبيق لتوفير البطارية"
+                    else -> "سبب آخر (" + r.reason + ")"
+                }
+                sb.append(DateFormat.getDateTimeInstance().format(Date(r.timestamp))).append("\n")
+                sb.append(why).append("\n").append(r.description ?: "").append("\n\n")
+            }
+        } else {
+            sb.append("هذه الميزة تحتاج أندرويد 11 أو أحدث.\n")
+        }
+        val crash = File(filesDir, "crash.txt")
+        if (crash.exists()) sb.append("\nآخر خطأ برمجي:\n").append(crash.readText().take(1500))
+        AlertDialog.Builder(this).setTitle("سبب آخر إغلاق").setMessage(sb.toString())
+            .setPositiveButton("حسنًا", null).show()
     }
 }
