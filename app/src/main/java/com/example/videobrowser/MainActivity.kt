@@ -134,6 +134,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val listLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        val d = r.data
+        val u = d?.getStringExtra("url")
+        if (r.resultCode == RESULT_OK && d != null && u != null) {
+            if (d.getBooleanExtra("newTab", false)) newTab(u) else cur?.web?.loadUrl(u)
+        }
+    }
+
+    private fun openList(key: String) {
+        listLauncher.launch(Intent(this, HistoryActivity::class.java).putExtra("key", key))
+    }
+
     private val scanLoop = object : Runnable {
         override fun run() {
             cur?.let { scan(it) }
@@ -523,10 +535,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun addHistory(title: String, url: String) {
         if (!url.startsWith("http")) return
-        val l = Store.get(this, "history")
-        l.removeAll { it.second == url }
-        l.add(0, title to url)
-        Store.put(this, "history", l)
+        val l = Store.entries(this, "history")
+        l.removeAll { it.url == url }
+        l.add(0, Store.Entry(title, url, System.currentTimeMillis()))
+        Store.putEntries(this, "history", l)
     }
 
     // ---------------------------------------------------------------- كشف الفيديو الذي يُشغَّل فعليًا
@@ -681,10 +693,18 @@ class MainActivity : AppCompatActivity() {
             clipToOutline = true
             outlineProvider = ViewOutlineProvider.BACKGROUND
         }
+        val firstKind = Util.kindOf("x." + list[0].ext)
         val thumb = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER
-            setImageResource(R.drawable.ic_video)
-            setColorFilter(0xFF90A4AE.toInt())
+            setImageResource(
+                when (firstKind) {
+                    "apk" -> R.drawable.ic_apk
+                    "audio" -> R.drawable.ic_music
+                    "video" -> R.drawable.ic_video
+                    else -> R.drawable.ic_file
+                }
+            )
+            setColorFilter(if (firstKind == "apk") 0xFF43A047.toInt() else 0xFF90A4AE.toInt())
         }
         tf.addView(thumb, FrameLayout.LayoutParams(MATCH, MATCH))
         val maxDur = list.maxOfOrNull { it.durSec } ?: 0.0
@@ -786,8 +806,14 @@ class MainActivity : AppCompatActivity() {
             }, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(8) })
             box.addView(h)
         }
+        var playBtn: TextView? = null
+        fun isMedia(f: Format): Boolean {
+            val k = Util.kindOf("x." + f.ext)
+            return f.kind == "hls" || f.isAudio || k == "video" || k == "audio"
+        }
         fun select(f: Format) {
             selected = f
+            playBtn?.visibility = if (isMedia(f)) View.VISIBLE else View.GONE
             for (r in rowsRef) {
                 val on = r.f === f
                 r.rb.isChecked = on
@@ -819,10 +845,17 @@ class MainActivity : AppCompatActivity() {
             box.addView(View(this).apply { setBackgroundColor(0xFFF1F3F4.toInt()) }, LinearLayout.LayoutParams(MATCH, dp(1)))
         }
         val audio = list.filter { it.isAudio || Formats.isAudio(it.ext) }
-        val video = list.filter { !(it.isAudio || Formats.isAudio(it.ext)) }
+        val rest = list.filter { !(it.isAudio || Formats.isAudio(it.ext)) }
+        val video = rest.filter { it.kind == "hls" || Util.kindOf("x." + it.ext) == "video" }
+        val files = rest.filter { !(it.kind == "hls" || Util.kindOf("x." + it.ext) == "video") }
         if (audio.isNotEmpty()) { section(R.drawable.ic_music, "الصوت"); audio.forEach { row(it) } }
         if (video.isNotEmpty()) { section(R.drawable.ic_play_circle, "الفيديو"); video.forEach { row(it) } }
-        (video.firstOrNull() ?: audio.firstOrNull())?.let { select(it) }
+        if (files.isNotEmpty()) {
+            val apk = files.any { Util.kindOf("x." + it.ext) == "apk" }
+            section(if (apk) R.drawable.ic_apk else R.drawable.ic_file, if (apk) "تطبيق" else "ملف")
+            files.forEach { row(it) }
+        }
+        (video.firstOrNull() ?: audio.firstOrNull() ?: files.firstOrNull())?.let { select(it) }
 
         val sv = ScrollView(this)
         sv.addView(box)
@@ -832,7 +865,7 @@ class MainActivity : AppCompatActivity() {
 
         // ---- الأزرار: تشغيل + تحميل
         val btns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        btns.addView(TextView(this).apply {
+        val pb = TextView(this).apply {
             text = "تشغيل"
             textSize = 16f
             gravity = Gravity.CENTER
@@ -846,7 +879,10 @@ class MainActivity : AppCompatActivity() {
                 val f = selected
                 if (f != null) playPreview(f, headers, et.text.toString())
             }
-        }, LinearLayout.LayoutParams(0, WRAP, 1f))
+        }
+        playBtn = pb
+        btns.addView(pb, LinearLayout.LayoutParams(0, WRAP, 1f))
+        selected?.let { pb.visibility = if (isMedia(it)) View.VISIBLE else View.GONE }
         btns.addView(TextView(this).apply {
             text = "تحميل"
             textSize = 16f
@@ -874,7 +910,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startDownload(f: Format, n: String, headers: Map<String, String>, poster: String) {
         var name = Util.safeName(n)
-        if (!name.contains('.') || name.substringAfterLast('.').length > 5) name += "." + f.ext
+        if (!name.endsWith("." + f.ext, true)) name += "." + f.ext
         val t = Task(UUID.randomUUID().toString(), f.url, name, f.kind, headers)
         t.mime = Util.mimeOf(name)
         t.thumbUrl = poster
@@ -886,10 +922,10 @@ class MainActivity : AppCompatActivity() {
     private fun addBookmark() {
         val t = cur
         if (t != null && t.url.startsWith("http")) {
-            val l = Store.get(this, "bookmarks")
-            l.removeAll { it.second == t.url }
-            l.add(0, t.title to t.url)
-            Store.put(this, "bookmarks", l)
+            val l = Store.entries(this, "bookmarks")
+            l.removeAll { it.url == t.url }
+            l.add(0, Store.Entry(t.title, t.url, System.currentTimeMillis()))
+            Store.putEntries(this, "bookmarks", l)
             toast("تمت الإضافة إلى الإشارات المرجعية")
         }
     }
@@ -944,9 +980,9 @@ class MainActivity : AppCompatActivity() {
         item(R.drawable.ic_tabs, "علامات التبويب (" + tabs.size + ")") { showTabs() }
         item(R.drawable.ic_home, "الصفحة الرئيسية") { cur?.web?.loadUrl(Prefs.home(this)) }
         line()
-        item(R.drawable.ic_history, "السجل") { showSaved("السجل", "history") }
+        item(R.drawable.ic_history, "السجل") { openList("history") }
         item(R.drawable.ic_download, "عمليات التنزيل") { startActivity(Intent(this, DownloadsActivity::class.java)) }
-        item(R.drawable.ic_star, "الإشارات المرجعية") { showSaved("الإشارات المرجعية", "bookmarks") }
+        item(R.drawable.ic_star, "الإشارات المرجعية") { openList("bookmarks") }
         line()
         item(R.drawable.ic_share, "مشاركة") {
             startActivity(

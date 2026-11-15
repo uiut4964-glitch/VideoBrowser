@@ -152,17 +152,25 @@ class DownloadsActivity : AppCompatActivity() {
         h.task = t
         h.name.text = t.name
 
-        val th = ThumbLoader.thumbFor(t)
+        val kind = Util.kindOf(t.name)
+        val th = if (kind == "video") ThumbLoader.thumbFor(t) else null
         if (th?.bmp != null) {
             h.thumb.clearColorFilter()
             h.thumb.scaleType = ImageView.ScaleType.CENTER_CROP
             h.thumb.setImageBitmap(th.bmp)
         } else {
             h.thumb.scaleType = ImageView.ScaleType.CENTER
-            h.thumb.setColorFilter(0xFF90A4AE.toInt())
-            h.thumb.setImageResource(R.drawable.ic_video)
+            h.thumb.setColorFilter(if (kind == "apk") 0xFF43A047.toInt() else 0xFF90A4AE.toInt())
+            h.thumb.setImageResource(
+                when (kind) {
+                    "apk" -> R.drawable.ic_apk
+                    "audio" -> R.drawable.ic_music
+                    "video" -> R.drawable.ic_video
+                    else -> R.drawable.ic_file
+                }
+            )
         }
-        ThumbLoader.loadTask(this, t) { refresh() }
+        if (kind == "video") ThumbLoader.loadTask(this, t) { refresh() }
 
         if (t.status == St.DONE) {
             h.bar.visibility = View.GONE
@@ -171,7 +179,7 @@ class DownloadsActivity : AppCompatActivity() {
             val d = th?.durMs ?: 0L
             h.dur.visibility = if (d > 0) View.VISIBLE else View.GONE
             if (d > 0) h.dur.text = Util.fmtDur(d / 1000.0)
-            h.btnA.setImageResource(R.drawable.ic_play)
+            h.btnA.setImageResource(when (kind) { "apk" -> R.drawable.ic_apk; "video", "audio" -> R.drawable.ic_play; else -> R.drawable.ic_file })
             h.btnA.setColorFilter(0xFF1565C0.toInt())
             h.btnA.background = circleStroke()
             h.btnB.setImageResource(R.drawable.ic_more)
@@ -244,7 +252,49 @@ class DownloadsActivity : AppCompatActivity() {
     }
 
     private fun play(t: Task) {
-        val done = DownloadCenter.tasks.filter { it.status == St.DONE && it.savedUri.isNotEmpty() }
+        when (Util.kindOf(t.name)) {
+            "video", "audio" -> playMedia(t)
+            "apk" -> install(t)
+            else -> openExternal(t)
+        }
+    }
+
+    private fun install(t: Task) {
+        if (!packageManager.canRequestPackageInstalls()) {
+            Toast.makeText(this, "اسمح لهذا التطبيق بتثبيت التطبيقات ثم ارجع واضغط تثبيت", Toast.LENGTH_LONG).show()
+            try {
+                startActivity(Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + packageName)))
+            } catch (e: Exception) {
+            }
+            return
+        }
+        try {
+            startActivity(
+                Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(Uri.parse(t.savedUri), "application/vnd.android.package-archive")
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            )
+        } catch (e: Exception) {
+            Toast.makeText(this, "تعذر فتح المثبّت (ربما حُذف الملف)", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun openExternal(t: Task) {
+        try {
+            startActivity(
+                Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(Uri.parse(t.savedUri), t.mime)
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            )
+        } catch (e: Exception) {
+            Toast.makeText(this, "لا يوجد تطبيق لفتح هذا الملف", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun playMedia(t: Task) {
+        val done = DownloadCenter.tasks.filter {
+            it.status == St.DONE && it.savedUri.isNotEmpty() && Util.kindOf(it.name).let { k -> k == "video" || k == "audio" }
+        }
         if (done.isEmpty()) return
         val idx = done.indexOf(t).coerceAtLeast(0)
         startActivity(
@@ -360,7 +410,7 @@ class DownloadsActivity : AppCompatActivity() {
                 val t = h.task ?: return@setOnClickListener
                 if (t.status == St.DONE) {
                     val pm = PopupMenu(c, btnB)
-                    pm.menu.add(0, 1, 0, "تشغيل")
+                    pm.menu.add(0, 1, 0, when (Util.kindOf(t.name)) { "apk" -> "تثبيت"; "video", "audio" -> "تشغيل"; else -> "فتح" })
                     pm.menu.add(0, 2, 1, "مشاركة")
                     pm.menu.add(0, 3, 2, "حذف")
                     pm.setOnMenuItemClickListener { mi ->

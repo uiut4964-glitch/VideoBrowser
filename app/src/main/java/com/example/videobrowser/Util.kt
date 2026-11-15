@@ -35,6 +35,17 @@ object Util {
 
     fun host(url: String): String = try { URL(url).host } catch (e: Exception) { url }
 
+    /** video / audio / apk / image / other */
+    fun kindOf(name: String): String {
+        return when (name.substringAfterLast('.', "").lowercase()) {
+            "mp4", "m4v", "webm", "mkv", "mov", "flv", "3gp", "ts", "avi", "wmv", "mpg", "mpeg" -> "video"
+            "mp3", "m4a", "aac", "ogg", "wav", "flac", "opus", "wma" -> "audio"
+            "apk" -> "apk"
+            "jpg", "jpeg", "png", "gif", "webp", "bmp" -> "image"
+            else -> "other"
+        }
+    }
+
     fun mimeOf(name: String): String {
         val ext = name.substringAfterLast('.', "").lowercase()
         return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
