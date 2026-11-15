@@ -12,7 +12,9 @@ class Format(
     val kind: String,
     val ext: String,
     val fromMaster: Boolean = false,
-    val sizeText: String = ""
+    val sizeText: String = "",
+    val isAudio: Boolean = false,
+    val durSec: Double = 0.0
 )
 
 object St {

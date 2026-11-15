@@ -368,17 +368,19 @@ object Engine {
         t.downloaded.set(bytes)
         t.lastBytes = bytes
 
-        val next = AtomicInteger(0)
         val err = AtomicReference<Exception?>(null)
         val keys = ConcurrentHashMap<String, ByteArray>()
         val ok = { alive() && err.get() == null }
-        val n = Prefs.parts(ctx).coerceIn(1, 16)
-        val threads = (0 until n).map {
+        val total = media.segs.size
+        val n = minOf(Prefs.parts(ctx).coerceIn(1, 16), total)
+        t.parts = n
+        val threads = (0 until n).map { k ->
+            val from = k * total / n
+            val to = (k + 1) * total / n
             Thread {
                 try {
-                    while (ok()) {
-                        val i = next.getAndIncrement()
-                        if (i >= media.segs.size) break
+                    for (i in from until to) {
+                        if (!ok()) break
                         val f = File(dir, "s$i")
                         if (f.exists()) continue
                         val s = media.segs[i]

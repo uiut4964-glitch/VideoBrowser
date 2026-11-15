@@ -143,7 +143,7 @@ class DownloadsActivity : AppCompatActivity() {
             Util.fmtSize(t.downloaded.get()) + (if (t.total > 0) " / " + Util.fmtSize(t.total) else "")
         }
         val sp = if (t.status == St.DOWNLOADING && t.speed > 0) "\n" + Util.fmtSpeed(t.speed) else ""
-        val pp = if (t.kind != "hls" && t.parts > 1) " • " + t.parts + " أجزاء" else ""
+        val pp = if (t.parts > 1) " • " + t.parts + " أجزاء" else ""
         return st + "\n" + size + pp + sp
     }
 
@@ -197,28 +197,44 @@ class DownloadsActivity : AppCompatActivity() {
         }
     }
 
+    /** نطاقات التقدم (بداية، نهاية) كنسبة من الملف كاملًا */
     private fun fractions(t: Task): FloatArray {
+        val out = ArrayList<Float>()
         if (t.kind == "hls") {
             val st = t.segState
             val n = st?.size ?: 0
             if (st != null && n > 0) {
-                val b = minOf(n, 40)
-                return FloatArray(b) { i ->
-                    val s = i * n / b
-                    val e = (i + 1) * n / b
-                    var c = 0
-                    for (k in s until e) if (st[k]) c++
-                    if (e > s) c.toFloat() / (e - s) else 0f
+                var i = 0
+                while (i < n) {
+                    if (st[i]) {
+                        var j = i
+                        while (j < n && st[j]) j++
+                        out.add(i.toFloat() / n)
+                        out.add(j.toFloat() / n)
+                        i = j
+                    } else {
+                        i++
+                    }
                 }
+                return out.toFloatArray()
             }
         } else {
             val d = t.partDone
             val sz = t.partSize
-            if (d != null && sz != null && d.size > 1 && sz.size == d.size) {
-                return FloatArray(d.size) { i -> if (sz[i] > 0) (d[i].toFloat() / sz[i]).coerceIn(0f, 1f) else 0f }
+            if (d != null && sz != null && sz.size == d.size && t.total > 0) {
+                var start = 0L
+                for (i in d.indices) {
+                    val dn = minOf(d[i], sz[i])
+                    if (dn > 0) {
+                        out.add(start.toFloat() / t.total)
+                        out.add((start + dn).toFloat() / t.total)
+                    }
+                    start += sz[i]
+                }
+                return out.toFloatArray()
             }
         }
-        return floatArrayOf(t.permille() / 1000f)
+        return floatArrayOf(0f, t.permille() / 1000f)
     }
 
     private fun circleStroke() = android.graphics.drawable.GradientDrawable().apply {

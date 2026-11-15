@@ -585,7 +585,11 @@ class MainActivity : AppCompatActivity() {
             if (src.startsWith("blob:")) t.sawBlob = true
             val cand = t.sniffed.filter { !others.contains(it.key) }
             val recent = cand.filter { it.value >= t.playStart - 5000 }
-            for (u in (if (recent.isNotEmpty()) recent else cand).keys) addTo(t, u)
+            val pick = LinkedHashMap<String, Long>()
+            pick.putAll(if (recent.isNotEmpty()) recent else cand)
+            // القائمة الرئيسية لبث m3u8 تُطلب عادةً قبل بدء التشغيل، فنُبقيها دائمًا ضمن المرشحين
+            for ((u, ts) in cand) if (u.contains(".m3u8", true)) pick[u] = ts
+            for (u in pick.keys) addTo(t, u)
         }
         updateFab()
     }
@@ -638,33 +642,100 @@ class MainActivity : AppCompatActivity() {
         return "المسار: " + (if (f == null) "Download/VideoBrowser" else (Uri.parse(f).lastPathSegment ?: f))
     }
 
+    private fun playPreview(f: Format, headers: Map<String, String>, title: String) {
+        val m = LinkedHashMap<String, String>(headers)
+        try {
+            val ck = CookieManager.getInstance().getCookie(f.url)
+            if (ck != null && !m.containsKey("Cookie")) m["Cookie"] = ck
+        } catch (e: Exception) {
+        }
+        val h = ArrayList<String>()
+        for ((k, v) in m) { h.add(k); h.add(v) }
+        startActivity(
+            Intent(this, PlayerActivity::class.java)
+                .putExtra("uris", arrayOf(f.url))
+                .putExtra("names", arrayOf(title))
+                .putExtra("headers", h.toTypedArray())
+                .putExtra("hls", f.kind == "hls")
+        )
+    }
+
     private fun showFormatSheet(list: List<Format>, headers: Map<String, String>, title: String, poster: String) {
         val dlg = BottomSheetDialog(this)
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(12))
+        val gray = 0xFF78909C.toInt()
+        val red = 0xFFE53935.toInt()
+        val outer = FrameLayout(this).apply {
             setBackgroundColor(Color.WHITE)
             layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(12))
+        }
+        outer.addView(root, FrameLayout.LayoutParams(MATCH, WRAP))
 
-        // الرأس: صورة مصغرة + اسم الملف
-        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        // ---- الرأس: صورة + مدة + الشبكة + الاسم + مشاركة + إغلاق
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val tf = FrameLayout(this).apply {
+            background = rounded(0xFF263238.toInt(), 6)
+            clipToOutline = true
+            outlineProvider = ViewOutlineProvider.BACKGROUND
+        }
         val thumb = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER
             setImageResource(R.drawable.ic_video)
             setColorFilter(0xFF90A4AE.toInt())
-            background = rounded(0xFFECEFF1.toInt(), 8)
-            clipToOutline = true
-            outlineProvider = ViewOutlineProvider.BACKGROUND
         }
+        tf.addView(thumb, FrameLayout.LayoutParams(MATCH, MATCH))
+        val maxDur = list.maxOfOrNull { it.durSec } ?: 0.0
+        if (maxDur > 0) {
+            tf.addView(TextView(this).apply {
+                text = Util.fmtDur(maxDur)
+                textSize = 11f
+                setTextColor(Color.WHITE)
+                background = rounded(0xAA000000.toInt(), 4)
+                setPadding(dp(5), dp(1), dp(5), dp(1))
+            }, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM or Gravity.END).apply { setMargins(dp(4), dp(4), dp(4), dp(4)) })
+        }
+        head.addView(tf, LinearLayout.LayoutParams(dp(120), dp(86)))
+        val infoCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        infoCol.addView(TextView(this).apply {
+            text = "الشبكة: " + (if (Net.onWifi(this@MainActivity)) "WiFi" else "بيانات الجوال")
+            textSize = 12f
+            setTextColor(gray)
+        })
         val et = EditText(this).apply {
             setText(title)
-            textSize = 14f
+            textSize = 15f
             maxLines = 3
+            background = null
+            setPadding(0, dp(2), 0, dp(2))
+            setTextColor(Color.BLACK)
         }
-        head.addView(thumb, LinearLayout.LayoutParams(dp(110), dp(70)))
-        head.addView(et, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(10) })
+        infoCol.addView(et)
+        infoCol.addView(TextView(this).apply {
+            text = "مشاركة"
+            textSize = 13f
+            setTextColor(0xFF455A64.toInt())
+            background = rounded(0xFFF1F3F4.toInt(), 18)
+            setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_share, 0, 0, 0)
+            compoundDrawableTintList = android.content.res.ColorStateList.valueOf(gray)
+            compoundDrawablePadding = dp(6)
+            setPadding(dp(14), dp(7), dp(14), dp(7))
+            setOnClickListener {
+                startActivity(
+                    Intent.createChooser(
+                        Intent(Intent.ACTION_SEND).setType("text/plain")
+                            .putExtra(Intent.EXTRA_TEXT, cur?.url ?: list[0].url),
+                        "مشاركة"
+                    )
+                )
+            }
+        }, LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(4) })
+        head.addView(infoCol, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(12); marginEnd = dp(26) })
         root.addView(head)
+        outer.addView(iconBtn(R.drawable.ic_close, gray, 12).apply { setOnClickListener { dlg.dismiss() } },
+            FrameLayout.LayoutParams(dp(40), dp(40), Gravity.TOP or Gravity.END))
         if (poster.startsWith("http")) {
             ThumbLoader.loadUrl(poster, headers) { b ->
                 if (b != null) {
@@ -675,10 +746,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // المسار
+        // ---- المسار
         val prow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         val pv = TextView(this).apply {
-            text = pathText(); textSize = 12f; setTextColor(0xFF607D8B.toInt())
+            text = pathText(); textSize = 12f; setTextColor(gray)
             maxLines = 1; ellipsize = TextUtils.TruncateAt.END
         }
         pathView = pv
@@ -689,71 +760,102 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { pickFolder.launch(null) }
         })
         root.addView(prow, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(6) })
-        root.addView(View(this).apply { setBackgroundColor(0xFFE0E0E0.toInt()) }, LinearLayout.LayoutParams(MATCH, dp(1)))
+        root.addView(View(this).apply { setBackgroundColor(0xFFE8EAED.toInt()) }, LinearLayout.LayoutParams(MATCH, dp(1)))
 
-        // قائمة الصيغ
+        // ---- القائمة: الصوت ثم الفيديو
+        class RowRef(val rb: RadioButton, val lbl: TextView, val size: TextView, val f: Format)
         var selected: Format? = null
-        val boxes = ArrayList<Pair<RadioButton, Format>>()
+        val rowsRef = ArrayList<RowRef>()
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val tint = android.content.res.ColorStateList(
+            arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(red, 0xFF9E9E9E.toInt())
+        )
         var rows = 0
         var sections = 0
-        fun section(text: String, color: Int) {
+        fun section(icon: Int, text: String) {
             sections++
-            box.addView(TextView(this).apply {
-                this.text = text; textSize = 14f; setTextColor(color)
+            val h = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(4), dp(14), dp(4), dp(6))
+            }
+            h.addView(ImageView(this).apply { setImageResource(icon); setColorFilter(0xFF37474F.toInt()) }, LinearLayout.LayoutParams(dp(24), dp(24)))
+            h.addView(TextView(this).apply {
+                this.text = text; textSize = 17f; setTextColor(0xFF37474F.toInt())
                 setTypeface(typeface, android.graphics.Typeface.BOLD)
-                setPadding(dp(4), dp(12), dp(4), dp(4))
-            })
+            }, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(8) })
+            box.addView(h)
+        }
+        fun select(f: Format) {
+            selected = f
+            for (r in rowsRef) {
+                val on = r.f === f
+                r.rb.isChecked = on
+                r.lbl.setTextColor(if (on) red else Color.BLACK)
+                r.size.setTextColor(if (on) red else gray)
+            }
         }
         fun row(f: Format) {
             rows++
-            val rb = RadioButton(this).apply { isClickable = false; isFocusable = false }
+            val rb = RadioButton(this).apply { isClickable = false; isFocusable = false; buttonTintList = tint }
+            val lbl = TextView(this).apply { text = f.label; textSize = 16f; setTextColor(Color.BLACK) }
+            val sz = TextView(this).apply { text = f.sizeText; textSize = 14f; setTextColor(gray) }
             val r = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(2), dp(6), dp(2), dp(6))
+                setPadding(dp(2), dp(4), dp(2), dp(4))
                 setBackgroundResource(ripple())
+                setOnClickListener { select(f) }
             }
             r.addView(rb)
-            r.addView(TextView(this).apply { text = f.label; textSize = 15f; setTextColor(Color.BLACK) },
-                LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(6) })
-            r.addView(TextView(this).apply {
-                text = if (f.kind == "hls") "HLS" else f.ext.uppercase()
-                textSize = 13f; gravity = Gravity.CENTER; setTextColor(0xFF607D8B.toInt())
-            }, LinearLayout.LayoutParams(dp(56), WRAP))
-            r.addView(TextView(this).apply {
-                text = f.sizeText; textSize = 13f; gravity = Gravity.CENTER_VERTICAL or Gravity.END
-                setTextColor(0xFF607D8B.toInt())
-            }, LinearLayout.LayoutParams(dp(92), WRAP))
-            r.setOnClickListener {
-                selected = f
-                boxes.forEach { it.first.isChecked = it.second === f }
+            r.addView(lbl, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(6) })
+            if (f.kind == "direct" && !f.isAudio) {
+                r.addView(TextView(this).apply { text = f.ext.uppercase(); textSize = 12f; setTextColor(gray) },
+                    LinearLayout.LayoutParams(WRAP, WRAP).apply { marginEnd = dp(14) })
             }
-            boxes.add(rb to f)
-            box.addView(r)
+            r.addView(sz)
+            rowsRef.add(RowRef(rb, lbl, sz, f))
+            box.addView(r, LinearLayout.LayoutParams(MATCH, dp(48)))
+            box.addView(View(this).apply { setBackgroundColor(0xFFF1F3F4.toInt()) }, LinearLayout.LayoutParams(MATCH, dp(1)))
         }
-        val video = list.filter { !Formats.isAudio(it.ext) }
-        val audio = list.filter { Formats.isAudio(it.ext) }
-        if (video.isNotEmpty()) { section("الفيديو", 0xFFE53935.toInt()); video.forEach { row(it) } }
-        if (audio.isNotEmpty()) { section("الصوت", 0xFF8E24AA.toInt()); audio.forEach { row(it) } }
-        boxes.firstOrNull()?.let { it.first.isChecked = true; selected = it.second }
+        val audio = list.filter { it.isAudio || Formats.isAudio(it.ext) }
+        val video = list.filter { !(it.isAudio || Formats.isAudio(it.ext)) }
+        if (audio.isNotEmpty()) { section(R.drawable.ic_music, "الصوت"); audio.forEach { row(it) } }
+        if (video.isNotEmpty()) { section(R.drawable.ic_play_circle, "الفيديو"); video.forEach { row(it) } }
+        (video.firstOrNull() ?: audio.firstOrNull())?.let { select(it) }
 
         val sv = ScrollView(this)
         sv.addView(box)
-        val maxH = (resources.displayMetrics.heightPixels * 0.42).toInt()
-        val wantH = rows * dp(50) + sections * dp(40) + dp(8)
+        val maxH = (resources.displayMetrics.heightPixels * 0.40).toInt()
+        val wantH = rows * dp(50) + sections * dp(44) + dp(8)
         root.addView(sv, LinearLayout.LayoutParams(MATCH, minOf(wantH, maxH)))
 
-        // زر التحميل
-        val btn = TextView(this).apply {
+        // ---- الأزرار: تشغيل + تحميل
+        val btns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        btns.addView(TextView(this).apply {
+            text = "تشغيل"
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(gray)
+            background = rounded(Color.WHITE, 6, 0xFFCFD8DC.toInt())
+            setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_play, 0, 0, 0)
+            compoundDrawableTintList = android.content.res.ColorStateList.valueOf(gray)
+            compoundDrawablePadding = dp(6)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setOnClickListener {
+                val f = selected
+                if (f != null) playPreview(f, headers, et.text.toString())
+            }
+        }, LinearLayout.LayoutParams(0, WRAP, 1f))
+        btns.addView(TextView(this).apply {
             text = "تحميل"
             textSize = 16f
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
-            background = rounded(0xFFE53935.toInt(), 8)
+            background = rounded(red, 6)
             setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_download, 0, 0, 0)
             compoundDrawablePadding = dp(8)
-            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setPadding(dp(12), dp(12), dp(12), dp(12))
             setOnClickListener {
                 val f = selected
                 if (f != null) {
@@ -761,10 +863,10 @@ class MainActivity : AppCompatActivity() {
                     startDownload(f, et.text.toString(), headers, poster)
                 }
             }
-        }
-        root.addView(btn, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(10) })
+        }, LinearLayout.LayoutParams(0, WRAP, 2f).apply { marginStart = dp(10) })
+        root.addView(btns, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(10) })
 
-        dlg.setContentView(root)
+        dlg.setContentView(outer)
         dlg.setOnDismissListener { pathView = null }
         dlg.behavior.state = BottomSheetBehavior.STATE_EXPANDED
         dlg.show()

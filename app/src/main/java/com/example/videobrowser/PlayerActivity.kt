@@ -17,7 +17,10 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.MediaItem as ExoItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 
@@ -83,10 +86,26 @@ class PlayerActivity : AppCompatActivity() {
         root.addView(bar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
         setContentView(root)
 
-        val p = ExoPlayer.Builder(this).build()
+        val builder = ExoPlayer.Builder(this)
+        val hdr = intent.getStringArrayExtra("headers")
+        if (hdr != null && hdr.size >= 2) {
+            val hm = HashMap<String, String>()
+            var k = 0
+            while (k + 1 < hdr.size) { hm[hdr[k]] = hdr[k + 1]; k += 2 }
+            val f = DefaultHttpDataSource.Factory().setDefaultRequestProperties(hm).setAllowCrossProtocolRedirects(true)
+            builder.setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(f))
+        }
+        val isHls = intent.getBooleanExtra("hls", false)
+        val p = builder.build()
         player = p
         pv.player = p
-        p.setMediaItems(uris.map { ExoItem.fromUri(it) }, index, 0L)
+        p.setMediaItems(
+            uris.map {
+                if (isHls) ExoItem.Builder().setUri(it).setMimeType(MimeTypes.APPLICATION_M3U8).build()
+                else ExoItem.fromUri(it)
+            },
+            index, 0L
+        )
         p.addListener(object : Player.Listener {
             override fun onMediaItemTransition(mediaItem: ExoItem?, reason: Int) {
                 title.text = names.getOrNull(p.currentMediaItemIndex) ?: ""

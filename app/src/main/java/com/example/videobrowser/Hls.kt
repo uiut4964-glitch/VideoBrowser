@@ -7,8 +7,9 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 object Hls {
-    class Variant(val url: String, val resolution: String, val bandwidth: Long)
-    class Seg(val url: String, val keyUri: String?, val iv: String?, val seq: Long)
+    class Variant(val url: String, val resolution: String, val bandwidth: Long, val avg: Long = 0L)
+    class Seg(val url: String, val keyUri: String?, val iv: String?, val seq: Long, val dur: Double = 0.0)
+    class Audio(val name: String, val url: String)
     class Media(val segs: List<Seg>, val initUrl: String?, val duration: Double)
 
     fun resolve(base: String, ref: String): String = URL(URL(base), ref).toString()
@@ -23,13 +24,30 @@ object Hls {
             val l = lines[i]
             if (l.startsWith("#EXT-X-STREAM-INF")) {
                 val bw = Regex("[:,]BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                val avg = Regex("AVERAGE-BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
                 val res = Regex("RESOLUTION=(\\d+x\\d+)").find(l)?.groupValues?.get(1) ?: ""
                 var j = i + 1
                 while (j < lines.size && (lines[j].isEmpty() || lines[j].startsWith("#"))) j++
-                if (j < lines.size) out.add(Variant(resolve(base, lines[j]), res, bw))
+                if (j < lines.size) out.add(Variant(resolve(base, lines[j]), res, bw, avg))
                 i = j
             }
             i++
+        }
+        return out
+    }
+
+    fun parseAudio(text: String, base: String): List<Audio> {
+        val out = ArrayList<Audio>()
+        val seen = HashSet<String>()
+        for (raw in text.lines()) {
+            val l = raw.trim()
+            if (l.startsWith("#EXT-X-MEDIA:") && l.contains("TYPE=AUDIO")) {
+                val u = Regex("URI=\"([^\"]+)\"").find(l)?.groupValues?.get(1) ?: continue
+                val full = resolve(base, u)
+                if (!seen.add(full)) continue
+                val n = Regex("NAME=\"([^\"]*)\"").find(l)?.groupValues?.get(1) ?: "صوت"
+                out.add(Audio(n, full))
+            }
         }
         return out
     }
@@ -66,7 +84,7 @@ object Hls {
                 l.startsWith("#EXTINF:") ->
                     dur = l.substringAfter(':').substringBefore(',').toDoubleOrNull() ?: 0.0
                 l.isNotEmpty() && !l.startsWith("#") -> {
-                    segs.add(Seg(resolve(base, l), keyUri, iv, seq))
+                    segs.add(Seg(resolve(base, l), keyUri, iv, seq, dur))
                     seq++
                     total += dur
                     dur = 0.0
