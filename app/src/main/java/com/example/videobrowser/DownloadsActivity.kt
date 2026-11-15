@@ -35,7 +35,7 @@ class DownloadsActivity : AppCompatActivity() {
 
     private inner class VH(
         val root: LinearLayout, val thumb: ImageView, val dur: TextView, val name: TextView,
-        val bar: ProgressBar, val info: TextView, val btnA: ImageButton, val btnB: ImageButton
+        val bar: SegmentBar, val info: TextView, val btnA: ImageButton, val btnB: ImageButton
     ) : RecyclerView.ViewHolder(root) {
         var task: Task? = null
     }
@@ -143,7 +143,8 @@ class DownloadsActivity : AppCompatActivity() {
             Util.fmtSize(t.downloaded.get()) + (if (t.total > 0) " / " + Util.fmtSize(t.total) else "")
         }
         val sp = if (t.status == St.DOWNLOADING && t.speed > 0) "\n" + Util.fmtSpeed(t.speed) else ""
-        return st + "\n" + size + sp
+        val pp = if (t.kind != "hls" && t.parts > 1) " • " + t.parts + " أجزاء" else ""
+        return st + "\n" + size + pp + sp
     }
 
     private fun bind(h: VH, t: Task) {
@@ -178,7 +179,7 @@ class DownloadsActivity : AppCompatActivity() {
         } else {
             h.dur.visibility = View.GONE
             h.bar.visibility = View.VISIBLE
-            h.bar.progress = t.permille()
+            h.bar.set(fractions(t))
             h.info.text = infoText(t)
             h.info.setTextColor(if (t.status == St.FAILED) 0xFFD32F2F.toInt() else 0xFF607D8B.toInt())
             h.btnA.setImageResource(
@@ -194,6 +195,30 @@ class DownloadsActivity : AppCompatActivity() {
             h.btnB.setImageResource(R.drawable.ic_close)
             h.btnB.setColorFilter(0xFFD32F2F.toInt())
         }
+    }
+
+    private fun fractions(t: Task): FloatArray {
+        if (t.kind == "hls") {
+            val st = t.segState
+            val n = st?.size ?: 0
+            if (st != null && n > 0) {
+                val b = minOf(n, 40)
+                return FloatArray(b) { i ->
+                    val s = i * n / b
+                    val e = (i + 1) * n / b
+                    var c = 0
+                    for (k in s until e) if (st[k]) c++
+                    if (e > s) c.toFloat() / (e - s) else 0f
+                }
+            }
+        } else {
+            val d = t.partDone
+            val sz = t.partSize
+            if (d != null && sz != null && d.size > 1 && sz.size == d.size) {
+                return FloatArray(d.size) { i -> if (sz[i] > 0) (d[i].toFloat() / sz[i]).coerceIn(0f, 1f) else 0f }
+            }
+        }
+        return floatArrayOf(t.permille() / 1000f)
     }
 
     private fun circleStroke() = android.graphics.drawable.GradientDrawable().apply {
@@ -284,7 +309,7 @@ class DownloadsActivity : AppCompatActivity() {
                 maxLines = 2
                 ellipsize = TextUtils.TruncateAt.END
             }
-            val bar = ProgressBar(c, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
+            val bar = SegmentBar(c)
             val info = TextView(c).apply { textSize = 12f }
             mid.addView(name)
             mid.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, c.dp(6)).apply { topMargin = c.dp(6) })

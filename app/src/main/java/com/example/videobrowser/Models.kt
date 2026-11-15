@@ -41,6 +41,9 @@ class Task(
     var segCount = 0
     var rangeOk = false
     var thumbUrl = ""
+    @Volatile var partDone: LongArray? = null
+    var partSize: LongArray? = null
+    @Volatile var segState: BooleanArray? = null
     val downloaded = AtomicLong(0)
     val segDone = AtomicInteger(0)
     @Volatile var speed = 0L

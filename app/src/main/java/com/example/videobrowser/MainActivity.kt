@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
@@ -36,7 +37,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.PopupMenu
+import android.widget.PopupWindow
 import android.widget.ProgressBar
 import android.widget.RadioButton
 import android.widget.ScrollView
@@ -100,6 +101,7 @@ class MainActivity : AppCompatActivity() {
         var activeId: String? = null
         var playStart = 0L
         var poster = ""
+        var lastForced = ""
     }
 
     private val tabs = ArrayList<Tab>()
@@ -111,8 +113,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fabIcon: ImageView
     private lateinit var badge: TextView
     private lateinit var tabBtn: TextView
-    private lateinit var backItem: View
-    private lateinit var fwdItem: View
     private val io = Executors.newCachedThreadPool()
     private val ui = Handler(Looper.getMainLooper())
     private var customView: View? = null
@@ -144,7 +144,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         DownloadCenter.init(this)
-        defaultUa = WebSettings.getDefaultUserAgent(this)
+        defaultUa = WebSettings.getDefaultUserAgent(this).replace("; wv", "").replace(Regex(" Version/\\d+\\.\\d+"), "")
         desktop = Prefs.desktop(this)
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -278,8 +278,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
         top.addView(urlBar, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginStart = dp(8); marginEnd = dp(2) })
-        top.addView(iconBtn(R.drawable.ic_refresh, dark, 9).apply { setOnClickListener { cur?.web?.reload() } },
-            LinearLayout.LayoutParams(dp(40), dp(40)))
         top.addView(iconBtn(R.drawable.ic_more, dark, 8).apply { setOnClickListener { showMenu(it) } },
             LinearLayout.LayoutParams(dp(40), dp(40)))
         root.addView(top, LinearLayout.LayoutParams(MATCH, WRAP))
@@ -334,39 +332,7 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        // الشريط السفلي
-        root.addView(View(this).apply { setBackgroundColor(0xFFDADCE0.toInt()) }, LinearLayout.LayoutParams(MATCH, dp(1)))
-        val bottom = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.WHITE)
-        }
-        fun nav(res: Int, label: String, onClick: () -> Unit): View {
-            val c = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                setBackgroundResource(ripple())
-                setOnClickListener { onClick() }
-            }
-            c.addView(ImageView(this).apply { setImageResource(res); setColorFilter(dark) }, LinearLayout.LayoutParams(dp(24), dp(24)))
-            c.addView(TextView(this).apply {
-                text = label; textSize = 10.5f; gravity = Gravity.CENTER; setTextColor(dark)
-            }, LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(2) })
-            bottom.addView(c, LinearLayout.LayoutParams(0, dp(54), 1f))
-            return c
-        }
-        backItem = nav(R.drawable.ic_back, "رجوع") { val t = cur; if (t != null && t.web.canGoBack()) t.web.goBack() }
-        fwdItem = nav(R.drawable.ic_forward, "أمام") { val t = cur; if (t != null && t.web.canGoForward()) t.web.goForward() }
-        nav(R.drawable.ic_home, "الرئيسية") { cur?.web?.loadUrl(Prefs.home(this)) }
-        nav(R.drawable.ic_tabs, "التبويبات") { showTabs() }
-        nav(R.drawable.ic_download, "التحميلات") { startActivity(Intent(this, DownloadsActivity::class.java)) }
-        root.addView(bottom, LinearLayout.LayoutParams(MATCH, WRAP))
         return root
-    }
-
-    private fun updateNav() {
-        val t = cur
-        backItem.alpha = if (t != null && t.web.canGoBack()) 1f else 0.35f
-        fwdItem.alpha = if (t != null && t.web.canGoForward()) 1f else 0.35f
     }
 
     private fun updateFab() {
@@ -408,7 +374,6 @@ class MainActivity : AppCompatActivity() {
         tabBtn.text = tabs.size.toString()
         progress.visibility = View.GONE
         updateFab()
-        updateNav()
     }
 
     private fun closeTab(t: Tab) {
@@ -469,6 +434,15 @@ class MainActivity : AppCompatActivity() {
         w.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
                 val u = r.url.toString()
+                val host = r.url.host ?: ""
+                if (r.isForMainFrame && host.startsWith("accounts.") && host.endsWith("google.com")) {
+                    val t = tabOf(v)
+                    if (t != null && t.lastForced != u) {
+                        t.lastForced = u
+                        v.loadUrl(u, mapOf("X-Requested-With" to ""))
+                        return true
+                    }
+                }
                 return !(u.startsWith("http://") || u.startsWith("https://") || u.startsWith("about:") ||
                     u.startsWith("data:") || u.startsWith("blob:"))
             }
@@ -481,7 +455,7 @@ class MainActivity : AppCompatActivity() {
                 t.activeId = null
                 t.sawBlob = false
                 t.poster = ""
-                if (t === cur) { urlBar.setText(url); updateFab(); updateNav() }
+                if (t === cur) { urlBar.setText(url); updateFab() }
             }
 
             override fun onPageFinished(v: WebView, url: String) {
@@ -489,7 +463,6 @@ class MainActivity : AppCompatActivity() {
                 t.url = url
                 t.title = v.title ?: url
                 addHistory(t.title, url)
-                if (t === cur) updateNav()
                 scan(t)
             }
 
@@ -807,55 +780,105 @@ class MainActivity : AppCompatActivity() {
         toast("بدأ التحميل — تابعه من زر (التحميلات)")
     }
 
-    // ---------------------------------------------------------------- القائمة
-    private fun showMenu(anchor: View) {
-        val pm = PopupMenu(this, anchor)
-        val m = pm.menu
-        m.add(0, 1, 0, "علامة تبويب جديدة")
-        m.add(0, 2, 1, "مشاركة")
-        m.add(0, 3, 2, "السجل")
-        m.add(0, 4, 3, "نسخ الرابط")
-        m.add(0, 5, 4, "العلامات المرجعية")
-        m.add(0, 6, 5, "إضافة علامة مرجعية")
-        m.add(0, 7, 6, "وضع سطح المكتب").isCheckable = true
-        m.add(0, 8, 7, "الإعدادات")
-        m.findItem(7).isChecked = desktop
-        pm.setOnMenuItemClickListener { item ->
-            when (item.itemId) {
-                1 -> newTab(Prefs.home(this))
-                2 -> startActivity(
-                    Intent.createChooser(
-                        Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, cur?.url ?: ""),
-                        "مشاركة"
-                    )
-                )
-                3 -> showSaved("السجل", "history")
-                4 -> {
-                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(ClipData.newPlainText("url", cur?.url ?: ""))
-                    toast("تم نسخ الرابط")
-                }
-                5 -> showSaved("العلامات المرجعية", "bookmarks")
-                6 -> {
-                    val t = cur
-                    if (t != null && t.url.startsWith("http")) {
-                        val l = Store.get(this, "bookmarks")
-                        l.removeAll { it.second == t.url }
-                        l.add(0, t.title to t.url)
-                        Store.put(this, "bookmarks", l)
-                        toast("تمت الإضافة إلى العلامات المرجعية")
-                    }
-                }
-                7 -> {
-                    desktop = !desktop
-                    tabs.forEach { applyUa(it.web) }
-                    cur?.web?.reload()
-                }
-                8 -> startActivity(Intent(this, SettingsActivity::class.java))
-            }
-            true
+    // ---------------------------------------------------------------- القائمة (على نمط كروم)
+    private fun addBookmark() {
+        val t = cur
+        if (t != null && t.url.startsWith("http")) {
+            val l = Store.get(this, "bookmarks")
+            l.removeAll { it.second == t.url }
+            l.add(0, t.title to t.url)
+            Store.put(this, "bookmarks", l)
+            toast("تمت الإضافة إلى الإشارات المرجعية")
         }
-        pm.show()
+    }
+
+    private fun showMenu(anchor: View) {
+        val dark = 0xFF37474F.toInt()
+        val screenW = resources.displayMetrics.widthPixels
+        val screenH = resources.displayMetrics.heightPixels
+        val pw = PopupWindow(this)
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            background = rounded(Color.WHITE, 16, 0xFFE0E0E0.toInt())
+            setPadding(dp(6), dp(8), dp(6), dp(8))
+        }
+        val topRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        fun topBtn(res: Int, enabled: Boolean = true, onClick: () -> Unit) {
+            val b = iconBtn(res, dark, 11)
+            b.background = circle(0xFFF1F3F4.toInt())
+            b.alpha = if (enabled) 1f else 0.35f
+            b.setOnClickListener { if (enabled) { pw.dismiss(); onClick() } }
+            topRow.addView(b, LinearLayout.LayoutParams(dp(46), dp(46)).apply { setMargins(dp(4), dp(2), dp(4), dp(2)) })
+        }
+        val t = cur
+        topBtn(R.drawable.ic_forward, t?.web?.canGoForward() == true) { cur?.web?.goForward() }
+        topBtn(R.drawable.ic_back, t?.web?.canGoBack() == true) { cur?.web?.goBack() }
+        topBtn(R.drawable.ic_star) { addBookmark() }
+        topBtn(R.drawable.ic_download) { startActivity(Intent(this, DownloadsActivity::class.java)) }
+        topBtn(R.drawable.ic_refresh) { cur?.web?.reload() }
+        col.addView(topRow)
+
+        fun line() = col.addView(View(this).apply { setBackgroundColor(0xFFE8EAED.toInt()) },
+            LinearLayout.LayoutParams(MATCH, dp(1)).apply { setMargins(dp(8), dp(6), dp(8), dp(6)) })
+
+        fun item(res: Int, text: String, mark: Boolean = false, onClick: () -> Unit) {
+            val r = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), 0, dp(12), 0)
+                setBackgroundResource(ripple())
+                setOnClickListener { pw.dismiss(); onClick() }
+            }
+            r.addView(ImageView(this).apply { setImageResource(res); setColorFilter(dark) }, LinearLayout.LayoutParams(dp(22), dp(22)))
+            r.addView(TextView(this).apply { this.text = text; textSize = 15f; setTextColor(Color.BLACK) },
+                LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(16) })
+            if (mark) r.addView(TextView(this).apply { this.text = "✓"; textSize = 16f; setTextColor(0xFF1565C0.toInt()) })
+            col.addView(r, LinearLayout.LayoutParams(MATCH, dp(48)))
+        }
+
+        line()
+        item(R.drawable.ic_add, "علامة تبويب جديدة") { newTab(Prefs.home(this)) }
+        item(R.drawable.ic_tabs, "علامات التبويب (" + tabs.size + ")") { showTabs() }
+        item(R.drawable.ic_home, "الصفحة الرئيسية") { cur?.web?.loadUrl(Prefs.home(this)) }
+        line()
+        item(R.drawable.ic_history, "السجل") { showSaved("السجل", "history") }
+        item(R.drawable.ic_download, "عمليات التنزيل") { startActivity(Intent(this, DownloadsActivity::class.java)) }
+        item(R.drawable.ic_star, "الإشارات المرجعية") { showSaved("الإشارات المرجعية", "bookmarks") }
+        line()
+        item(R.drawable.ic_share, "مشاركة") {
+            startActivity(
+                Intent.createChooser(
+                    Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, cur?.url ?: ""),
+                    "مشاركة"
+                )
+            )
+        }
+        item(R.drawable.ic_copy, "نسخ الرابط") {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("url", cur?.url ?: ""))
+            toast("تم نسخ الرابط")
+        }
+        item(R.drawable.ic_desktop, "وضع سطح المكتب", desktop) {
+            desktop = !desktop
+            tabs.forEach { applyUa(it.web) }
+            cur?.web?.reload()
+        }
+        line()
+        item(R.drawable.ic_settings, "الإعدادات") { startActivity(Intent(this, SettingsActivity::class.java)) }
+
+        val sv = ScrollView(this)
+        sv.addView(col)
+        pw.contentView = sv
+        pw.width = dp(280)
+        pw.height = minOf(dp(600), (screenH * 0.85).toInt())
+        pw.isFocusable = true
+        pw.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        pw.elevation = dp(10).toFloat()
+        val loc = IntArray(2)
+        anchor.getLocationOnScreen(loc)
+        val x = loc[0].coerceIn(dp(8), maxOf(dp(8), screenW - dp(280) - dp(8)))
+        pw.showAtLocation(anchor.rootView, Gravity.TOP or Gravity.LEFT, x, loc[1])
     }
 
     private fun showSaved(title: String, key: String) {

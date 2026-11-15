@@ -99,7 +99,16 @@ object DownloadCenter {
         var b = 0L
         val rx = Regex(if (t.kind == "hls") "s\\d+" else "p\\d+")
         dir.listFiles()?.forEach { f -> if (rx.matches(f.name)) { c++; b += f.length() } }
-        if (t.kind == "hls") t.segDone.set(c)
+        if (t.kind == "hls") {
+            t.segDone.set(c)
+            if (t.segCount > 0) t.segState = BooleanArray(t.segCount) { File(dir, "s$it").exists() }
+        } else if (t.parts > 1 && t.total > 0) {
+            val n = t.parts
+            val chunk = t.total / n
+            val sizes = LongArray(n) { i -> if (i == n - 1) t.total - chunk * (n - 1) else chunk }
+            t.partSize = sizes
+            t.partDone = LongArray(n) { i -> minOf(File(dir, "p$i").length(), sizes[i]) }
+        }
         t.downloaded.set(b)
         t.lastBytes = b
     }
@@ -272,6 +281,12 @@ object Engine {
         }
         t.downloaded.set(have)
         t.lastBytes = have
+        val psz = LongArray(ranges.size) { i -> if (ranges[i][1] >= 0) ranges[i][1] - ranges[i][0] + 1 else 0L }
+        t.partSize = psz
+        t.partDone = LongArray(ranges.size) { i ->
+            val fl = File(dir, "p$i").length()
+            if (psz[i] > 0) minOf(fl, psz[i]) else fl
+        }
 
         val err = AtomicReference<Exception?>(null)
         val ok = { alive() && err.get() == null }
@@ -300,6 +315,8 @@ object Engine {
             f.delete()
         }
         val have = f.length()
+        val pd = t.partDone
+        if (pd != null && i < pd.size) pd[i] = have
         if (end >= 0 && start + have > end) return
         val rs = start + have
         val range = if (t.rangeOk) "bytes=$rs-" + (if (end >= 0) end.toString() else "") else null
@@ -318,6 +335,7 @@ object Engine {
                         out.write(buf, 0, n)
                         remaining -= n
                         t.downloaded.addAndGet(n.toLong())
+                        if (pd != null && i < pd.size) pd[i] += n.toLong()
                     }
                 }
             }
@@ -344,6 +362,8 @@ object Engine {
             val f = File(dir, "s$i")
             if (f.exists()) { done++; bytes += f.length() }
         }
+        val segSt = BooleanArray(media.segs.size) { File(dir, "s$it").exists() }
+        t.segState = segSt
         t.segDone.set(done)
         t.downloaded.set(bytes)
         t.lastBytes = bytes
@@ -372,6 +392,7 @@ object Engine {
                         val tmp = File(dir, "s$i.tmp")
                         tmp.writeBytes(data)
                         tmp.renameTo(f)
+                        segSt[i] = true
                         t.segDone.incrementAndGet()
                         t.downloaded.addAndGet(data.size.toLong())
                     }
