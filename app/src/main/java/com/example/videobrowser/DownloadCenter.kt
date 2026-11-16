@@ -165,6 +165,17 @@ object DownloadCenter {
         startNext()
     }
 
+    /** استبدال رابط التحميل (بعد انتهاء صلاحيته) ثم الاستئناف من حيث توقف إن أمكن */
+    fun replaceSource(t: Task, newUrl: String, newHeaders: Map<String, String>) {
+        if (t.status != St.PAUSED && t.status != St.FAILED) return
+        t.url = newUrl
+        t.headers = newHeaders
+        t.error = ""
+        t.notice = ""
+        save()
+        resume(t)
+    }
+
     fun cancel(t: Task) {
         t.stop = true
         t.gen++
@@ -215,6 +226,7 @@ object DownloadCenter {
         try {
             if (Prefs.wifiOnly(ctx) && !Net.onWifi(ctx)) throw IOException("لا يوجد اتصال Wi-Fi (الإعداد: Wi-Fi فقط)")
             t.error = ""
+            t.notice = ""
             if (t.kind == "hls") Engine.hls(t, alive) else Engine.direct(t, alive)
             if (!alive()) return
             t.status = St.MERGING
@@ -253,6 +265,15 @@ object Engine {
     fun direct(t: Task, alive: () -> Boolean) {
         val dir = tmpDir(t)
         val p = Net.probe(t.url, t.headers)
+        val oldTotal = t.total
+        val hadParts = dir.listFiles()?.any { it.name.matches(Regex("p\\d+")) } ?: false
+        if (hadParts && oldTotal > 0 && p.total > 0 && p.total != oldTotal) {
+            // الملف الجديد يختلف في الحجم: لا يمكن الدمج مع الأجزاء القديمة
+            dir.listFiles()?.forEach { it.delete() }
+            t.parts = 0
+            t.downloaded.set(0)
+            t.notice = "تغيّر حجم الملف فبدأ التحميل من جديد"
+        }
         t.total = p.total
         t.rangeOk = p.rangeOk
         val hasParts = (dir.listFiles()?.any { it.name.matches(Regex("p\\d+")) } ?: false) && t.parts > 0
@@ -350,6 +371,10 @@ object Engine {
         val dir = tmpDir(t)
         val media = Hls.parseMedia(Net.fetchText(t.url, t.headers), t.url)
         if (media.segs.isEmpty()) throw IOException("لا توجد مقاطع للتحميل")
+        if (t.segCount > 0 && t.segCount != media.segs.size) {
+            dir.listFiles()?.forEach { it.delete() }
+            t.notice = "تغيّر عدد المقاطع فبدأ التحميل من جديد"
+        }
         t.segCount = media.segs.size
         val initUrl = media.initUrl
         if (initUrl != null) {

@@ -120,6 +120,8 @@ class MainActivity : AppCompatActivity() {
     private var desktop = false
     private lateinit var defaultUa: String
     private var pathView: TextView? = null
+    private var refreshId: String? = null
+    private lateinit var refreshBar: TextView
 
     private val pickFolder = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
         if (uri != null) {
@@ -140,6 +142,26 @@ class MainActivity : AppCompatActivity() {
         if (r.resultCode == RESULT_OK && d != null && u != null) {
             if (d.getBooleanExtra("newTab", false)) newTab(u) else cur?.web?.loadUrl(u)
         }
+    }
+
+    // ---------------------------------------------------------------- وضع تحديث رابط تحميل فاشل
+    private fun refreshTask(): Task? = refreshId?.let { id -> DownloadCenter.tasks.firstOrNull { it.id == id } }
+
+    private fun clearRefresh() {
+        refreshId = null
+        refreshBar.visibility = View.GONE
+    }
+
+    private fun handleRefreshIntent(i: Intent?) {
+        if (i == null) return
+        val id = i.getStringExtra("refreshTask") ?: return
+        val page = i.getStringExtra("refreshUrl") ?: return
+        i.removeExtra("refreshTask")
+        val t = DownloadCenter.tasks.firstOrNull { it.id == id } ?: return
+        refreshId = id
+        refreshBar.text = "تحديث رابط «" + t.name + "»: شغّل نفس الفيديو ثم اضغط الزر الأحمر واختر نفس الجودة. (اضغط هنا للإلغاء)"
+        refreshBar.visibility = View.VISIBLE
+        newTab(page)
     }
 
     private fun openList(key: String) {
@@ -166,6 +188,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(buildUi())
         CookieManager.getInstance().setAcceptCookie(true)
         restoreTabs(intent?.data?.toString())
+        handleRefreshIntent(intent)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -183,6 +206,7 @@ class MainActivity : AppCompatActivity() {
         super.onNewIntent(intent)
         val u = intent.data?.toString()
         if (u != null) newTab(u)
+        handleRefreshIntent(intent)
     }
 
     override fun onResume() {
@@ -299,6 +323,16 @@ class MainActivity : AppCompatActivity() {
             visibility = View.GONE
         }
         root.addView(progress, LinearLayout.LayoutParams(MATCH, dp(3)))
+
+        refreshBar = TextView(this).apply {
+            textSize = 13f
+            setTextColor(0xFF5D4037.toInt())
+            setBackgroundColor(0xFFFFF3E0.toInt())
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            visibility = View.GONE
+            setOnClickListener { clearRefresh() }
+        }
+        root.addView(refreshBar, LinearLayout.LayoutParams(MATCH, WRAP))
 
         content = FrameLayout(this)
         root.addView(content, LinearLayout.LayoutParams(MATCH, 0, 1f))
@@ -856,6 +890,11 @@ class MainActivity : AppCompatActivity() {
             files.forEach { row(it) }
         }
         (video.firstOrNull() ?: audio.firstOrNull() ?: files.firstOrNull())?.let { select(it) }
+        val rt0 = refreshTask()
+        if (rt0 != null && rt0.total > 0) {
+            list.filter { it.kind == rt0.kind && it.bytes > 0 }
+                .minByOrNull { Math.abs(it.bytes - rt0.total) }?.let { select(it) }
+        }
 
         val sv = ScrollView(this)
         sv.addView(box)
@@ -884,7 +923,7 @@ class MainActivity : AppCompatActivity() {
         btns.addView(pb, LinearLayout.LayoutParams(0, WRAP, 1f))
         selected?.let { pb.visibility = if (isMedia(it)) View.VISIBLE else View.GONE }
         btns.addView(TextView(this).apply {
-            text = "تحميل"
+            text = if (refreshTask() != null) "تحديث الرابط واستئناف" else "تحميل"
             textSize = 16f
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
@@ -909,6 +948,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startDownload(f: Format, n: String, headers: Map<String, String>, poster: String) {
+        val rt = refreshTask()
+        if (rt != null) {
+            if (rt.kind != f.kind) {
+                toast("نوع الرابط مختلف عن الملف الأصلي، اختر نفس الجودة")
+                return
+            }
+            DownloadCenter.replaceSource(rt, f.url, headers)
+            clearRefresh()
+            toast("تم تحديث الرابط واستئناف التحميل — تابعه من (التحميلات)")
+            return
+        }
         var name = Util.safeName(n)
         if (!name.endsWith("." + f.ext, true)) name += "." + f.ext
         val t = Task(UUID.randomUUID().toString(), f.url, name, f.kind, headers)

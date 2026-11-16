@@ -9,7 +9,12 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
+import android.content.ClipboardManager
+import android.content.res.ColorStateList
+import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.FrameLayout
+import androidx.activity.OnBackPressedCallback
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -32,10 +37,14 @@ class DownloadsActivity : AppCompatActivity() {
     private lateinit var ind1: View
     private val adapter = Adapter()
     private val listener: () -> Unit = { refresh() }
+    private var selecting = false
+    private val selected = HashSet<String>()
+    private lateinit var titleTv: TextView
 
     private inner class VH(
         val root: LinearLayout, val thumb: ImageView, val dur: TextView, val name: TextView,
-        val bar: SegmentBar, val info: TextView, val btnA: ImageButton, val btnB: ImageButton
+        val bar: SegmentBar, val info: TextView, val btnA: ImageButton, val btnB: ImageButton,
+        val check: CheckBox
     ) : RecyclerView.ViewHolder(root) {
         var task: Task? = null
     }
@@ -56,15 +65,25 @@ class DownloadsActivity : AppCompatActivity() {
             setBackgroundColor(Color.WHITE)
             setPadding(dp(4), dp(6), dp(12), dp(6))
         }
-        header.addView(iconBtn(R.drawable.ic_back, dark).apply { setOnClickListener { finish() } },
+        header.addView(iconBtn(R.drawable.ic_back, dark).apply {
+            setOnClickListener { if (selecting) exitSelect() else finish() }
+        }, LinearLayout.LayoutParams(dp(44), dp(44)))
+        titleTv = TextView(this).apply { text = "التحميلات"; textSize = 19f; setTextColor(Color.BLACK) }
+        header.addView(titleTv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = dp(6) })
+        header.addView(iconBtn(R.drawable.ic_check_box, dark).apply { setOnClickListener { selectAll() } },
             LinearLayout.LayoutParams(dp(44), dp(44)))
-        header.addView(TextView(this).apply { text = "التحميلات"; textSize = 19f; setTextColor(Color.BLACK) },
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = dp(6) })
+        header.addView(iconBtn(R.drawable.ic_delete, dark).apply { setOnClickListener { deleteSelected() } },
+            LinearLayout.LayoutParams(dp(44), dp(44)))
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (selecting) exitSelect() else finish()
+            }
+        })
         root.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(Color.WHITE) }
         fun mk(m: Int): Pair<TextView, View> {
-            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setOnClickListener { mode = m; refresh() } }
+            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setOnClickListener { mode = m; selected.clear(); refresh() } }
             val tv = TextView(this).apply {
                 textSize = 15f; gravity = Gravity.CENTER; setPadding(0, dp(12), 0, dp(10))
             }
@@ -113,6 +132,8 @@ class DownloadsActivity : AppCompatActivity() {
 
     private fun refresh() {
         val all = DownloadCenter.tasks
+        selected.retainAll(all.map { it.id }.toSet())
+        updateTitle()
         val active = all.count { it.status != St.DONE }
         val done = all.count { it.status == St.DONE }
         adapter.data = all.filter { (it.status == St.DONE) == (mode == 1) }
@@ -126,6 +147,119 @@ class DownloadsActivity : AppCompatActivity() {
         tab1.setTextColor(if (mode == 1) blue else grey)
         ind0.setBackgroundColor(if (mode == 0) blue else Color.TRANSPARENT)
         ind1.setBackgroundColor(if (mode == 1) blue else Color.TRANSPARENT)
+    }
+
+    // ---------------------------------------------------------------- التحديد المتعدد
+    private fun updateTitle() {
+        titleTv.text = if (selecting) selected.size.toString() + " محدد" else "التحميلات"
+    }
+
+    private fun startSelect(t: Task) {
+        selecting = true
+        selected.add(t.id)
+        updateTitle()
+        adapter.notifyDataSetChanged()
+    }
+
+    private fun toggle(t: Task) {
+        if (!selected.remove(t.id)) selected.add(t.id)
+        updateTitle()
+        adapter.notifyDataSetChanged()
+    }
+
+    private fun exitSelect() {
+        selecting = false
+        selected.clear()
+        updateTitle()
+        adapter.notifyDataSetChanged()
+    }
+
+    private fun selectAll() {
+        val vis = adapter.data
+        if (vis.isEmpty()) return
+        selecting = true
+        if (vis.all { selected.contains(it.id) }) selected.clear() else selected.addAll(vis.map { it.id })
+        updateTitle()
+        adapter.notifyDataSetChanged()
+    }
+
+    private fun deleteSelected() {
+        if (!selecting || selected.isEmpty()) {
+            Toast.makeText(this, "اضغط زر التحديد ثم اختر الملفات التي تريد حذفها", Toast.LENGTH_LONG).show()
+            if (!selecting) {
+                selecting = true
+                updateTitle()
+                adapter.notifyDataSetChanged()
+            }
+            return
+        }
+        val list = DownloadCenter.tasks.filter { selected.contains(it.id) }
+        confirm("حذف " + list.size + " عنصر؟ سيتم حذف الملفات المكتملة من الجهاز وإلغاء التحميلات غير المكتملة.") {
+            for (t in list) {
+                if (t.status == St.DONE) DownloadCenter.deleteFinished(t) else DownloadCenter.cancel(t)
+            }
+            exitSelect()
+        }
+    }
+
+    // ---------------------------------------------------------------- خيارات التحميل غير المكتمل
+    private fun showTaskMenu(t: Task, anchor: View) {
+        val pm = PopupMenu(this, anchor)
+        val canFix = t.status == St.PAUSED || t.status == St.FAILED
+        if (canFix) {
+            pm.menu.add(0, 1, 0, "تحديث رابط التحميل (من صفحة الفيديو)")
+            pm.menu.add(0, 2, 1, "لصق رابط جديد")
+        }
+        pm.menu.add(0, 3, 2, "إلغاء وحذف")
+        pm.setOnMenuItemClickListener { mi ->
+            when (mi.itemId) {
+                1 -> refreshFromPage(t)
+                2 -> pasteUrl(t)
+                3 -> confirm("إلغاء هذا التحميل وحذف ما تم تحميله؟") { DownloadCenter.cancel(t) }
+            }
+            true
+        }
+        pm.show()
+    }
+
+    /** يفتح صفحة الفيديو الأصلية في المتصفح ليلتقط رابطًا جديدًا ويكمل التحميل */
+    private fun refreshFromPage(t: Task) {
+        val page = t.headers["Referer"] ?: t.url
+        startActivity(
+            Intent(this, MainActivity::class.java)
+                .putExtra("refreshTask", t.id)
+                .putExtra("refreshUrl", page)
+        )
+    }
+
+    private fun pasteUrl(t: Task) {
+        val et = EditText(this).apply {
+            hint = "https://..."
+            setSingleLine()
+            textDirection = View.TEXT_DIRECTION_LTR
+        }
+        try {
+            val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val c = cm.primaryClip?.getItemAt(0)?.text?.toString()?.trim()
+            if (c != null && c.startsWith("http")) et.setText(c)
+        } catch (e: Exception) {
+        }
+        val box = FrameLayout(this).apply { setPadding(dp(20), dp(8), dp(20), 0); addView(et) }
+        AlertDialog.Builder(this)
+            .setTitle("رابط التحميل الجديد")
+            .setMessage("ألصق رابط نفس الملف. إن كان بنفس الحجم يكمل التحميل من حيث توقف، وإلا يبدأ من جديد.")
+            .setView(box)
+            .setPositiveButton("تحديث") { _, _ ->
+                val u = et.text.toString().trim()
+                if (u.startsWith("http")) {
+                    DownloadCenter.replaceSource(t, u, t.headers)
+                    Toast.makeText(this, "تم تحديث الرابط واستئناف التحميل", Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(this, "الرابط غير صالح", Toast.LENGTH_LONG).show()
+                }
+            }
+            .setNegativeButton("إلغاء", null)
+            .show()
     }
 
     private fun infoText(t: Task): String {
@@ -144,7 +278,8 @@ class DownloadsActivity : AppCompatActivity() {
         }
         val sp = if (t.status == St.DOWNLOADING && t.speed > 0) "\n" + Util.fmtSpeed(t.speed) else ""
         val pp = if (t.parts > 1) " • " + t.parts + " أجزاء" else ""
-        return st + "\n" + size + pp + sp
+        val nt = if (t.notice.isNotEmpty()) "\n" + t.notice else ""
+        return st + "\n" + size + pp + sp + nt
     }
 
     private fun bind(h: VH, t: Task) {
@@ -171,6 +306,8 @@ class DownloadsActivity : AppCompatActivity() {
             )
         }
         if (kind == "video") ThumbLoader.loadTask(this, t) { refresh() }
+        h.check.visibility = if (selecting) View.VISIBLE else View.GONE
+        h.check.isChecked = selected.contains(t.id)
 
         if (t.status == St.DONE) {
             h.bar.visibility = View.GONE
@@ -200,8 +337,15 @@ class DownloadsActivity : AppCompatActivity() {
             h.btnA.setColorFilter(dark)
             h.btnA.background = circleStroke()
             h.btnA.visibility = if (t.status == St.MERGING) View.INVISIBLE else View.VISIBLE
-            h.btnB.setImageResource(R.drawable.ic_close)
-            h.btnB.setColorFilter(0xFFD32F2F.toInt())
+            h.btnB.setImageResource(R.drawable.ic_more)
+            h.btnB.setColorFilter(dark)
+        }
+        if (selecting) {
+            h.btnA.visibility = View.GONE
+            h.btnB.visibility = View.GONE
+        } else {
+            h.btnB.visibility = View.VISIBLE
+            if (t.status != St.MERGING) h.btnA.visibility = View.VISIBLE
         }
     }
 
@@ -365,6 +509,11 @@ class DownloadsActivity : AppCompatActivity() {
             tf.addView(thumb, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             tf.addView(dur, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM or Gravity.START).apply { setMargins(c.dp(4), c.dp(4), c.dp(4), c.dp(4)) })
+            val check = CheckBox(c).apply {
+                buttonTintList = ColorStateList.valueOf(0xFF1565C0.toInt())
+                visibility = View.GONE
+            }
+            root.addView(check, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = c.dp(4) })
             root.addView(tf, LinearLayout.LayoutParams(c.dp(104), c.dp(70)))
 
             // الاسم + التقدم + المعلومات
@@ -390,13 +539,20 @@ class DownloadsActivity : AppCompatActivity() {
             root.addView(btnA, LinearLayout.LayoutParams(c.dp(40), c.dp(40)))
             root.addView(btnB, LinearLayout.LayoutParams(c.dp(40), c.dp(40)).apply { marginStart = c.dp(4) })
 
-            val h = VH(root, thumb, dur, name, bar, info, btnA, btnB)
+            val h = VH(root, thumb, dur, name, bar, info, btnA, btnB, check)
 
             val open = View.OnClickListener {
                 val t = h.task
-                if (t != null && t.status == St.DONE) play(t)
+                if (t != null) {
+                    if (selecting) toggle(t) else if (t.status == St.DONE) play(t)
+                }
             }
             root.setOnClickListener(open)
+            check.setOnClickListener { h.task?.let { toggle(it) } }
+            root.setOnLongClickListener {
+                h.task?.let { startSelect(it) }
+                true
+            }
 
             btnA.setOnClickListener {
                 val t = h.task ?: return@setOnClickListener
@@ -423,7 +579,7 @@ class DownloadsActivity : AppCompatActivity() {
                     }
                     pm.show()
                 } else {
-                    confirm("إلغاء هذا التحميل وحذف ما تم تحميله؟") { DownloadCenter.cancel(t) }
+                    showTaskMenu(t, btnB)
                 }
             }
             return h

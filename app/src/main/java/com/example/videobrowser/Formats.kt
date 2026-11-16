@@ -90,7 +90,7 @@ object Formats {
                     val label = if (hh > 0) qualityLabel(w, hh)
                     else "جودة " + String.format(Locale.US, "%.1f Mbps", v.bandwidth / 1_000_000.0)
                     if (est <= 0 && v.bandwidth > 0 && dur > 0) est = (v.bandwidth / 8 * dur).toLong()
-                    out.add(Format(label, v.resolution, v.url, "hls", "ts", true, fmtEst(est), false, dur))
+                    out.add(Format(label, v.resolution, v.url, "hls", "ts", true, fmtEst(est), false, dur, est))
                 }
                 for (a in Hls.parseAudio(text, item.url).take(3)) {
                     var est = -1L
@@ -131,7 +131,7 @@ object Formats {
             val d = ArrayList<String>()
             d.add(Util.host(item.url))
             d.add(if (p.rangeOk) "يدعم التجزئة والاستئناف" else "بدون تجزئة/استئناف")
-            out.add(Format(label, d.joinToString(" • "), item.url, "direct", ext, false, Util.fmtSize(p.total), audio))
+            out.add(Format(label, d.joinToString(" • "), item.url, "direct", ext, false, Util.fmtSize(p.total), audio, 0.0, p.total))
         }
         return out
     }

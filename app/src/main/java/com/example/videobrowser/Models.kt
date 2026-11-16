@@ -14,7 +14,8 @@ class Format(
     val fromMaster: Boolean = false,
     val sizeText: String = "",
     val isAudio: Boolean = false,
-    val durSec: Double = 0.0
+    val durSec: Double = 0.0,
+    val bytes: Long = -1L
 )
 
 object St {
@@ -28,11 +29,12 @@ object St {
 
 class Task(
     val id: String,
-    val url: String,
+    var url: String,
     var name: String,
     val kind: String,
-    val headers: Map<String, String>
+    var headers: Map<String, String>
 ) {
+    @Volatile var notice = ""
     var total = -1L
     var parts = 0
     @Volatile var status = St.QUEUED
