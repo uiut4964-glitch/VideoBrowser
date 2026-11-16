@@ -30,6 +30,9 @@ object Prefs {
     fun desktop(c: Context): Boolean = sp(c).getBoolean("desktop", false)
     fun setDesktop(c: Context, v: Boolean) { sp(c).edit().putBoolean("desktop", v).apply() }
 
+    fun remux(c: Context): Boolean = sp(c).getBoolean("remux", true)
+    fun setRemux(c: Context, v: Boolean) { sp(c).edit().putBoolean("remux", v).apply() }
+
     fun wifiOnly(c: Context): Boolean = sp(c).getBoolean("wifi", false)
     fun setWifiOnly(c: Context, v: Boolean) { sp(c).edit().putBoolean("wifi", v).apply() }
 }

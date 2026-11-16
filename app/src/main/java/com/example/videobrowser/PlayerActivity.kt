@@ -21,6 +21,7 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 
@@ -87,13 +88,15 @@ class PlayerActivity : AppCompatActivity() {
         setContentView(root)
 
         val builder = ExoPlayer.Builder(this)
+        val msf = DefaultMediaSourceFactory(this, DefaultExtractorsFactory().setConstantBitrateSeekingEnabled(true))
+        builder.setMediaSourceFactory(msf)
         val hdr = intent.getStringArrayExtra("headers")
         if (hdr != null && hdr.size >= 2) {
             val hm = HashMap<String, String>()
             var k = 0
             while (k + 1 < hdr.size) { hm[hdr[k]] = hdr[k + 1]; k += 2 }
             val f = DefaultHttpDataSource.Factory().setDefaultRequestProperties(hm).setAllowCrossProtocolRedirects(true)
-            builder.setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(f))
+            msf.setDataSourceFactory(f)
         }
         val isHls = intent.getBooleanExtra("hls", false)
         val p = builder.build()

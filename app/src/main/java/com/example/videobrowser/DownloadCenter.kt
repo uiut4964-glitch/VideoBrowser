@@ -185,6 +185,18 @@ object DownloadCenter {
         startNext()
     }
 
+    fun repair(t: Task, cb: (Boolean) -> Unit) {
+        if (t.status != St.DONE || t.savedUri.isEmpty() || t.notice == "جارٍ إصلاح الملف...") return
+        t.notice = "جارٍ إصلاح الملف..."
+        changed()
+        pool.execute {
+            val ok = try { Engine.repair(t) } catch (e: Exception) { false }
+            t.notice = if (ok) "" else "تعذّر إصلاح الملف"
+            if (ok) save()
+            main.post { changed(); cb(ok) }
+        }
+    }
+
     fun deleteFinished(t: Task) {
         tasks.remove(t)
         save(); changed()
@@ -469,6 +481,79 @@ object Engine {
         }
     }
 
+    private fun swapExt(name: String, ext: String): String {
+        val i = name.lastIndexOf('.')
+        return (if (i > 0) name.substring(0, i) else name) + "." + ext
+    }
+
+    /** هل ملف MP4 مجزأ (fragmented) ؟ أي بلا فهرس كامل للتقديم */
+    private fun isFragmented(f: File): Boolean {
+        try {
+            java.io.RandomAccessFile(f, "r").use { r ->
+                var pos = 0L
+                val len = r.length()
+                val hdr = ByteArray(16)
+                while (pos + 8 <= len) {
+                    r.seek(pos)
+                    r.readFully(hdr, 0, 8)
+                    var size = ((hdr[0].toLong() and 0xff) shl 24) or ((hdr[1].toLong() and 0xff) shl 16) or
+                        ((hdr[2].toLong() and 0xff) shl 8) or (hdr[3].toLong() and 0xff)
+                    val type = String(hdr, 4, 4, Charsets.ISO_8859_1)
+                    if (size == 1L) {
+                        if (pos + 16 > len) return false
+                        r.readFully(hdr, 8, 8)
+                        size = 0L
+                        for (k in 8 until 16) size = (size shl 8) or (hdr[k].toLong() and 0xff)
+                    }
+                    if (type == "moof") return true
+                    if (type == "mdat") return false
+                    if (size < 8) return false
+                    pos += size
+                }
+            }
+        } catch (e: Exception) {
+        }
+        return false
+    }
+
+    /** إصلاح ملف فيديو مكتمل: يعيد بناءه كـ MP4 سليم ثم يستبدل القديم */
+    fun repair(t: Task): Boolean {
+        val inF = File(ctx.cacheDir, "repair_in_" + t.id)
+        val outF = File(ctx.cacheDir, "repair_out_" + t.id + ".mp4")
+        try {
+            val ins = ctx.contentResolver.openInputStream(Uri.parse(t.savedUri)) ?: return false
+            ins.use { i -> FileOutputStream(inF).use { o -> i.copyTo(o, 256 * 1024) } }
+            val res = Remux.run(inF, outF) ?: return false
+            val newName = swapExt(t.name, if (res.hasVideo) "mp4" else "m4a")
+            val mime = Util.mimeOf(newName)
+            val d = openDest(newName, mime)
+            try {
+                d.out.use { o -> FileInputStream(outF).use { it.copyTo(o, 256 * 1024) } }
+                d.finish()
+            } catch (e: Exception) {
+                try { ctx.contentResolver.delete(d.uri, null, null) } catch (x: Exception) {}
+                return false
+            }
+            val oldUri = t.savedUri
+            t.savedUri = d.uri.toString()
+            t.name = d.name
+            t.mime = mime
+            t.total = outF.length()
+            try {
+                val u = Uri.parse(oldUri)
+                if (DocumentsContract.isDocumentUri(ctx, u)) DocumentsContract.deleteDocument(ctx.contentResolver, u)
+                else ctx.contentResolver.delete(u, null, null)
+            } catch (e: Exception) {
+            }
+            return true
+        } catch (e: Exception) {
+            return false
+        } finally {
+            inF.delete()
+            outF.delete()
+        }
+    }
+
     fun merge(t: Task) {
         val dir = tmpPath(t)
         val files = ArrayList<File>()
@@ -484,18 +569,45 @@ object Engine {
             for (i in 0 until maxOf(t.parts, 1)) files.add(File(dir, "p$i"))
         }
         for (f in files) if (!f.exists()) throw IOException("ملف مؤقت مفقود")
+
+        // تحويل إلى MP4 سليم (يصلح التقديم والتأخير والمدة)
+        var src: List<File> = files
+        val ext0 = name.substringAfterLast('.', "").lowercase()
+        val candidate = Prefs.remux(ctx) && (t.kind == "hls" || ext0 == "ts" ||
+            ((ext0 == "mp4" || ext0 == "m4v" || ext0 == "mov") && isFragmented(files[0])))
+        if (candidate) {
+            var ok = false
+            try {
+                val merged = File(dir, "merged.tmp")
+                FileOutputStream(merged).use { o -> for (f in files) FileInputStream(f).use { it.copyTo(o, 256 * 1024) } }
+                val outF = File(dir, "remux.mp4")
+                if (outF.exists()) outF.delete()
+                val res = Remux.run(merged, outF)
+                merged.delete()
+                if (res != null && outF.length() > 0) {
+                    src = listOf(outF)
+                    name = swapExt(name, if (res.hasVideo) "mp4" else "m4a")
+                    ok = true
+                } else {
+                    outF.delete()
+                }
+            } catch (e: Exception) {
+            }
+            if (!ok) t.notice = "تعذّر تحويل الملف إلى MP4، حُفظ بصيغته الأصلية وقد لا يدعم التقديم"
+        }
+
         val mime = Util.mimeOf(name)
         val d = openDest(name, mime)
         try {
             d.out.use { o ->
-                for (f in files) FileInputStream(f).use { it.copyTo(o, 256 * 1024) }
+                for (f in src) FileInputStream(f).use { it.copyTo(o, 256 * 1024) }
             }
             d.finish()
         } catch (e: Exception) {
             try { ctx.contentResolver.delete(d.uri, null, null) } catch (e2: Exception) {}
             throw e
         }
-        t.total = files.sumOf { it.length() }
+        t.total = src.sumOf { it.length() }
         t.savedUri = d.uri.toString()
         t.name = d.name
         t.mime = mime

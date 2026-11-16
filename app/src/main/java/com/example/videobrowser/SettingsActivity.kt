@@ -145,6 +145,10 @@ class SettingsActivity : AppCompatActivity() {
 
         add("تشخيص: سبب آخر إغلاق للتطبيق", "اضغط لعرض السبب") { showExitReason() }
 
+        add("تحويل البث إلى MP4 قابل للتقديم", onOff(Prefs.remux(this)) + " — يصلح التقديم والتأخير ومدة الفيديو") {
+            Prefs.setRemux(this, !Prefs.remux(this)); render()
+        }
+
         add("مسح السجل", "حذف سجل التصفح") {
             Store.put(this, "history", emptyList())
             Toast.makeText(this, "تم مسح السجل", Toast.LENGTH_SHORT).show()
