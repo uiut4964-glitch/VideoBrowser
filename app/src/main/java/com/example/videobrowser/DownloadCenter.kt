@@ -3,23 +3,47 @@ package com.example.videobrowser
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
+import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import androidx.core.content.ContextCompat
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.EditedMediaItemSequence
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.Transformer
 import androidx.documentfile.provider.DocumentFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.BufferedInputStream
+import java.io.DataInputStream
+import java.io.EOFException
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.io.OutputStream
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.Locale
+import kotlin.math.ceil
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
@@ -185,18 +209,6 @@ object DownloadCenter {
         startNext()
     }
 
-    fun repair(t: Task, cb: (Boolean) -> Unit) {
-        if (t.status != St.DONE || t.savedUri.isEmpty() || t.notice == "جارٍ إصلاح الملف...") return
-        t.notice = "جارٍ إصلاح الملف..."
-        changed()
-        pool.execute {
-            val ok = try { Engine.repair(t) } catch (e: Exception) { false }
-            t.notice = if (ok) "" else "تعذّر إصلاح الملف"
-            if (ok) save()
-            main.post { changed(); cb(ok) }
-        }
-    }
-
     fun deleteFinished(t: Task) {
         tasks.remove(t)
         save(); changed()
@@ -350,29 +362,47 @@ object Engine {
         val have = f.length()
         val pd = t.partDone
         if (pd != null && i < pd.size) pd[i] = have
-        if (end >= 0 && start + have > end) return
+        if (end >= 0 && start + have > end + 1L) throw IOException("حجم الجزء المؤقت أكبر من النطاق المطلوب")
+        if (end >= 0 && start + have == end + 1L) return
         val rs = start + have
         val range = if (t.rangeOk) "bytes=$rs-" + (if (end >= 0) end.toString() else "") else null
         val c = Net.connect(t.url, t.headers, range)
         try {
             val code = c.responseCode
-            if (t.rangeOk && code != 206) throw IOException("HTTP $code")
-            if (!t.rangeOk && code != 200) throw IOException("HTTP $code")
+            if (t.rangeOk) {
+                if (code != 206) throw IOException("الخادم لم يحترم طلب Range (HTTP $code)")
+                val cr = Net.parseContentRange(c.getHeaderField("Content-Range"))
+                    ?: throw IOException("استجابة Range بلا Content-Range صالح")
+                val expectedEnd = if (end >= 0) end else cr.end
+                if (cr.start != rs || cr.end != expectedEnd || (t.total > 0 && cr.total != t.total)) {
+                    throw IOException("نطاق البايتات الذي أعاده الخادم لا يطابق الجزء المطلوب")
+                }
+                val expectedLength = cr.end - cr.start + 1L
+                if (c.contentLengthLong >= 0L && c.contentLengthLong != expectedLength) {
+                    throw IOException("حجم جزء HTTP لا يطابق Content-Range")
+                }
+            } else if (code != 200) {
+                throw IOException("HTTP $code")
+            }
+            val expected = if (end >= 0) end - rs + 1L else c.contentLengthLong
+            var received = 0L
             val buf = ByteArray(64 * 1024)
-            var remaining = if (end >= 0) end - rs + 1 else Long.MAX_VALUE
             c.inputStream.use { inp ->
                 FileOutputStream(f, true).use { out ->
-                    while (ok() && remaining > 0) {
-                        val n = inp.read(buf, 0, minOf(buf.size.toLong(), remaining).toInt())
+                    while (ok() && (expected < 0L || received < expected)) {
+                        val limit = if (expected >= 0L) minOf(buf.size.toLong(), expected - received).toInt() else buf.size
+                        if (limit <= 0) break
+                        val n = inp.read(buf, 0, limit)
                         if (n < 0) break
+                        if (n == 0) continue
                         out.write(buf, 0, n)
-                        remaining -= n
+                        received += n.toLong()
                         t.downloaded.addAndGet(n.toLong())
                         if (pd != null && i < pd.size) pd[i] += n.toLong()
                     }
                 }
             }
-            if (ok() && end >= 0 && remaining > 0) throw IOException("انقطع الاتصال")
+            if (ok() && expected >= 0L && received != expected) throw IOException("انقطع الاتصال قبل اكتمال جزء التنزيل")
         } finally {
             c.disconnect()
         }
@@ -381,32 +411,89 @@ object Engine {
     // ---------- تحميل HLS (m3u8) ----------
     fun hls(t: Task, alive: () -> Boolean) {
         val dir = tmpDir(t)
-        val media = Hls.parseMedia(Net.fetchText(t.url, t.headers), t.url)
+        val playlistText = Net.fetchText(t.url, t.headers)
+        val media = Hls.parseMedia(playlistText, t.url)
         if (media.segs.isEmpty()) throw IOException("لا توجد مقاطع للتحميل")
-        if (t.segCount > 0 && t.segCount != media.segs.size) {
-            dir.listFiles()?.forEach { it.delete() }
-            t.notice = "تغيّر عدد المقاطع فبدأ التحميل من جديد"
+
+        // Resume only when the exact playlist content is unchanged. A matching segment
+        // count alone is not enough: URLs, byte ranges, keys and sequence numbers may differ.
+        val fingerprint = sha256(structureOf(media).toByteArray(Charsets.UTF_8))
+        val marker = File(dir, "hls-manifest.sha256")
+        val oldFingerprint = marker.takeIf { it.exists() }?.readText()?.trim()
+        val hasOldSegments = dir.listFiles()?.any { it.name.matches(Regex("s\\d+")) || it.name == "init" } == true
+        val mustReset = (oldFingerprint == null && hasOldSegments) ||
+            (oldFingerprint != null && oldFingerprint != fingerprint) ||
+            (t.segCount > 0 && t.segCount != media.segs.size)
+        if (mustReset) {
+            dir.listFiles()?.forEach { f ->
+                if (f.name.matches(Regex("s\\d+")) || f.name.matches(Regex("s\\d+\\.tmp")) ||
+                    f.name == "init" || f.name == "init.tmp" || f.name == "hls-source.tmp" ||
+                    f.name == "hls-final.mp4" || f.name == "hls-final.ts" ||
+                    f.name == "hls-final-discontinuous.mp4" || f.name == "hls-local-discontinuous.m3u8") f.delete()
+            }
+            t.segCount = 0
+            t.segDone.set(0)
+            t.downloaded.set(0)
+            t.notice = when {
+                oldFingerprint == null && hasOldSegments -> "أُعيد تنزيل المقاطع القديمة للتحقق من توافقها مع الإصدار الحالي"
+                oldFingerprint != null && oldFingerprint != fingerprint -> "تغيّرت قائمة البث؛ أُعيد تنزيل المقاطع لضمان عدم خلط ملفات مختلفة"
+                else -> "تغيّر عدد المقاطع؛ أُعيد تنزيلها"
+            }
         }
+        marker.writeText(fingerprint)
         t.segCount = media.segs.size
-        val initUrl = media.initUrl
-        if (initUrl != null) {
-            val f = File(dir, "init")
-            if (!f.exists()) Net.saveBytes(initUrl, t.headers, f)
+        t.expectedDurationSec = media.duration
+        t.segmentDurations = media.segs.map { it.dur }.toDoubleArray()
+        t.segmentDiscontinuities = media.segs.map { it.discontinuityBefore }.toBooleanArray()
+        t.hasHlsDiscontinuity = media.hasDiscontinuity
+        if (!media.endList) {
+            t.notice = (t.notice.takeIf { it.isNotEmpty() }?.plus(" — ") ?: "") +
+                "تنبيه: قائمة HLS لا تحتوي ENDLIST؛ قد تكون بثًا حيًا أو لقطة غير مكتملة"
         }
+        if (media.hasDiscontinuity) {
+            t.notice = (t.notice.takeIf { it.isNotEmpty() }?.plus(" — ") ?: "") +
+                "تحتوي القائمة على فواصل زمنية؛ ستُعاد معالجة المقاطع بالتتابع لإنتاج MP4 بجدول توقيت موحّد"
+        }
+
+        val keys = ConcurrentHashMap<String, ByteArray>()
+        fun keyFor(uri: String): ByteArray = keys[uri] ?: synchronized(keys) {
+            keys[uri] ?: Net.readBytes(uri, t.headers).also {
+                if (it.size != 16) throw IOException("حجم مفتاح AES-128 غير صحيح")
+                keys[uri] = it
+            }
+        }
+
+        media.init?.let { init ->
+            val f = File(dir, "init")
+            if (!f.exists()) {
+                var data = if (init.rangeStart != null && init.rangeLength != null) {
+                    Net.readRangeBytes(init.url, t.headers, init.rangeStart, init.rangeLength)
+                } else {
+                    Net.readBytes(init.url, t.headers)
+                }
+                if (init.keyUri != null) data = Hls.decrypt(data, keyFor(init.keyUri), init.iv, 0L)
+                val tmp = File(dir, "init.tmp")
+                tmp.writeBytes(data)
+                if (!tmp.renameTo(f)) {
+                    tmp.delete()
+                    throw IOException("تعذر حفظ ملف تهيئة HLS")
+                }
+            }
+        }
+
         var done = 0
         var bytes = 0L
         for (i in media.segs.indices) {
             val f = File(dir, "s$i")
-            if (f.exists()) { done++; bytes += f.length() }
+            if (f.exists() && f.length() > 0L) { done++; bytes += f.length() }
         }
-        val segSt = BooleanArray(media.segs.size) { File(dir, "s$it").exists() }
+        val segSt = BooleanArray(media.segs.size) { File(dir, "s$it").let { f -> f.exists() && f.length() > 0L } }
         t.segState = segSt
         t.segDone.set(done)
         t.downloaded.set(bytes)
         t.lastBytes = bytes
 
         val err = AtomicReference<Exception?>(null)
-        val keys = ConcurrentHashMap<String, ByteArray>()
         val ok = { alive() && err.get() == null }
         val total = media.segs.size
         val n = minOf(Prefs.parts(ctx).coerceIn(1, 16), total)
@@ -419,18 +506,22 @@ object Engine {
                     for (i in from until to) {
                         if (!ok()) break
                         val f = File(dir, "s$i")
-                        if (f.exists()) continue
-                        val s = media.segs[i]
-                        var data = withRetry(ok) { Net.readBytes(s.url, t.headers) }
-                        val ku = s.keyUri
-                        if (ku != null) {
-                            val key = keys.getOrPut(ku) { Net.readBytes(ku, t.headers) }
-                            data = Hls.decrypt(data, key, s.iv, s.seq)
+                        if (f.exists() && f.length() > 0L) continue
+                        val seg = media.segs[i]
+                        var data = withRetry(ok) {
+                            if (seg.rangeStart != null && seg.rangeLength != null) {
+                                Net.readRangeBytes(seg.url, t.headers, seg.rangeStart, seg.rangeLength)
+                            } else Net.readBytes(seg.url, t.headers)
                         }
+                        if (seg.keyUri != null) data = Hls.decrypt(data, keyFor(seg.keyUri), seg.iv, seg.seq)
                         if (!ok()) break
+                        if (data.isEmpty()) throw IOException("المقطع ${i + 1} فارغ")
                         val tmp = File(dir, "s$i.tmp")
                         tmp.writeBytes(data)
-                        tmp.renameTo(f)
+                        if (!tmp.renameTo(f)) {
+                            tmp.delete()
+                            throw IOException("تعذر حفظ المقطع ${i + 1}")
+                        }
                         segSt[i] = true
                         t.segDone.incrementAndGet()
                         t.downloaded.addAndGet(data.size.toLong())
@@ -443,8 +534,45 @@ object Engine {
         threads.forEach { it.join() }
         err.get()?.let { throw it }
         if (!alive()) return
-        if (t.segDone.get() < t.segCount) throw IOException("بعض المقاطع ناقصة")
+        if (t.segDone.get() < t.segCount || media.segs.indices.any { !File(dir, "s$it").let { f -> f.exists() && f.length() > 0L } }) {
+            throw IOException("بعض مقاطع HLS ناقصة")
+        }
     }
+
+    /**
+     * بصمة بنية القائمة (عدد المقاطع، المدد، النطاقات، الفواصل) دون عناوين URL،
+     * كي لا يُحذف ما تم تنزيله عند تغيّر رموز الروابط المؤقتة (token) أو بعد تحديث رابط التحميل.
+     */
+    private fun structureOf(m: Hls.Media): String {
+        val sb = StringBuilder()
+        sb.append("v2|").append(m.segs.size).append('|').append(m.endList).append('|')
+        val ini = m.init
+        if (ini != null) sb.append("init:").append(ini.rangeStart).append(':').append(ini.rangeLength).append('|')
+        for (s in m.segs) {
+            sb.append(s.seq).append(':')
+                .append(String.format(Locale.US, "%.3f", s.dur)).append(':')
+                .append(s.rangeStart).append(':').append(s.rangeLength).append(':')
+                .append(if (s.discontinuityBefore) 1 else 0).append(':')
+                .append(if (s.keyUri != null) 1 else 0).append(';')
+        }
+        return sb.toString()
+    }
+
+    /** يتأكد من وجود مساحة كافية للملف الوسيط والملف النهائي قبل بدء الدمج */
+    private fun ensureFreeSpace(dir: File, sources: List<File>) {
+        val bytes = sources.sumOf { it.length() }
+        val need = (bytes.toDouble() * 2.1).toLong() + 128L * 1024L * 1024L
+        val free = dir.usableSpace
+        if (free < need) {
+            throw IOException(
+                "المساحة الحرة غير كافية للدمج: المتاح " + formatBytes(free) + "، والمطلوب تقريبًا " + formatBytes(need) +
+                    ". حرّر مساحة ثم أعد المحاولة؛ لن تُحذف المقاطع التي تم تنزيلها."
+            )
+        }
+    }
+
+    private fun sha256(data: ByteArray): String = MessageDigest.getInstance("SHA-256")
+        .digest(data).joinToString("") { "%02x".format(it) }
 
     // ---------- دمج الأجزاء وحفظ الملف النهائي ----------
     private class Dest(val out: OutputStream, val uri: Uri, val name: String, val finish: () -> Unit)
@@ -481,136 +609,562 @@ object Engine {
         }
     }
 
-    private fun swapExt(name: String, ext: String): String {
-        val i = name.lastIndexOf('.')
-        return (if (i > 0) name.substring(0, i) else name) + "." + ext
-    }
-
-    /** هل ملف MP4 مجزأ (fragmented) ؟ أي بلا فهرس كامل للتقديم */
-    private fun isFragmented(f: File): Boolean {
-        try {
-            java.io.RandomAccessFile(f, "r").use { r ->
-                var pos = 0L
-                val len = r.length()
-                val hdr = ByteArray(16)
-                while (pos + 8 <= len) {
-                    r.seek(pos)
-                    r.readFully(hdr, 0, 8)
-                    var size = ((hdr[0].toLong() and 0xff) shl 24) or ((hdr[1].toLong() and 0xff) shl 16) or
-                        ((hdr[2].toLong() and 0xff) shl 8) or (hdr[3].toLong() and 0xff)
-                    val type = String(hdr, 4, 4, Charsets.ISO_8859_1)
-                    if (size == 1L) {
-                        if (pos + 16 > len) return false
-                        r.readFully(hdr, 8, 8)
-                        size = 0L
-                        for (k in 8 until 16) size = (size shl 8) or (hdr[k].toLong() and 0xff)
-                    }
-                    if (type == "moof") return true
-                    if (type == "mdat") return false
-                    if (size < 8) return false
-                    pos += size
-                }
-            }
-        } catch (e: Exception) {
-        }
-        return false
-    }
-
-    /** إصلاح ملف فيديو مكتمل: يعيد بناءه كـ MP4 سليم ثم يستبدل القديم */
-    fun repair(t: Task): Boolean {
-        val inF = File(ctx.cacheDir, "repair_in_" + t.id)
-        val outF = File(ctx.cacheDir, "repair_out_" + t.id + ".mp4")
-        try {
-            val ins = ctx.contentResolver.openInputStream(Uri.parse(t.savedUri)) ?: return false
-            ins.use { i -> FileOutputStream(inF).use { o -> i.copyTo(o, 256 * 1024) } }
-            val res = Remux.run(inF, outF) ?: return false
-            val newName = swapExt(t.name, if (res.hasVideo) "mp4" else "m4a")
-            val mime = Util.mimeOf(newName)
-            val d = openDest(newName, mime)
-            try {
-                d.out.use { o -> FileInputStream(outF).use { it.copyTo(o, 256 * 1024) } }
-                d.finish()
-            } catch (e: Exception) {
-                try { ctx.contentResolver.delete(d.uri, null, null) } catch (x: Exception) {}
-                return false
-            }
-            val oldUri = t.savedUri
-            t.savedUri = d.uri.toString()
-            t.name = d.name
-            t.mime = mime
-            t.total = outF.length()
-            try {
-                val u = Uri.parse(oldUri)
-                if (DocumentsContract.isDocumentUri(ctx, u)) DocumentsContract.deleteDocument(ctx.contentResolver, u)
-                else ctx.contentResolver.delete(u, null, null)
-            } catch (e: Exception) {
-            }
-            return true
-        } catch (e: Exception) {
-            return false
-        } finally {
-            inF.delete()
-            outF.delete()
-        }
-    }
-
     fun merge(t: Task) {
         val dir = tmpPath(t)
         val files = ArrayList<File>()
         var name = t.name
+        var temporaryHlsOutput: File? = null
+
         if (t.kind == "hls") {
-            val ini = File(dir, "init")
-            if (ini.exists()) {
-                files.add(ini)
-                if (name.endsWith(".ts", true)) name = name.dropLast(2) + "mp4"
-            }
+            val init = File(dir, "init")
+            if (init.exists()) files.add(init)
             for (i in 0 until t.segCount) files.add(File(dir, "s$i"))
+            for (f in files) if (!f.exists() || f.length() == 0L) throw IOException("مقطع HLS مفقود أو فارغ")
+
+            // Never label a byte-concatenated TS/FMP4 stream as MP4. Use the
+            // container-appropriate path, and rebuild timestamp discontinuities as
+            // a sequence of independent media items before saving the final file.
+            ensureFreeSpace(dir, files)
+            val hasInitMap = init.exists()
+            val rebuilt = if (hasInitMap) File(dir, "hls-final.mp4") else File(dir, "hls-final.ts")
+            if (rebuilt.exists()) rebuilt.delete()
+            try {
+                if (hasInitMap) {
+                    // fMP4 segments need their initialization section and a newly-built
+                    // MP4 sample table/index so duration and seeking are correct.
+                    remuxHlsSegmentsToMp4(dir, t.segCount, t.segmentDurations, t.expectedDurationSec, rebuilt)
+                    verifyHlsDuration(rebuilt, t.expectedDurationSec)
+                    name = withExtension(name, "mp4")
+                } else if (t.hasHlsDiscontinuity) {
+                    // A discontinuity can reset timestamps or change encoding/track
+                    // parameters. Treat each TS segment as a separate Media3 input and
+                    // compose them sequentially so the output timeline is rebuilt.
+                    // Try lossless transmuxing first; fall back to device transcoding
+                    // only if the segment sample formats are not mutually compatible.
+                    val discontinuousMp4 = File(dir, "hls-final-discontinuous.mp4")
+                    if (discontinuousMp4.exists()) discontinuousMp4.delete()
+                    try {
+                        rebuildDiscontinuousTransportStream(
+                            dir, t.segCount, t.segmentDurations, t.segmentDiscontinuities,
+                            t.expectedDurationSec, discontinuousMp4
+                        )
+                    } catch (e: Exception) {
+                        discontinuousMp4.delete()
+                        throw e
+                    }
+                    // Use the remuxed MP4 as the final intermediate file.
+                    temporaryHlsOutput = discontinuousMp4
+                    name = withExtension(name, "mp4")
+                } else {
+                    // A continuous MPEG-TS playlist can be preserved losslessly as TS.
+                    concatenateHlsTransportStream(dir, t.segCount, rebuilt)
+                    name = withExtension(name, "ts")
+                }
+            } catch (e: Exception) {
+                rebuilt.delete()
+                throw e
+            }
+            if (temporaryHlsOutput == null) temporaryHlsOutput = rebuilt
+            files.clear()
+            files.add(temporaryHlsOutput!!)
         } else {
             for (i in 0 until maxOf(t.parts, 1)) files.add(File(dir, "p$i"))
         }
-        for (f in files) if (!f.exists()) throw IOException("ملف مؤقت مفقود")
 
-        // تحويل إلى MP4 سليم (يصلح التقديم والتأخير والمدة)
-        var src: List<File> = files
-        val ext0 = name.substringAfterLast('.', "").lowercase()
-        val candidate = Prefs.remux(ctx) && (t.kind == "hls" || ext0 == "ts" ||
-            ((ext0 == "mp4" || ext0 == "m4v" || ext0 == "mov") && isFragmented(files[0])))
-        if (candidate) {
-            var ok = false
-            try {
-                val merged = File(dir, "merged.tmp")
-                FileOutputStream(merged).use { o -> for (f in files) FileInputStream(f).use { it.copyTo(o, 256 * 1024) } }
-                val outF = File(dir, "remux.mp4")
-                if (outF.exists()) outF.delete()
-                val res = Remux.run(merged, outF)
-                merged.delete()
-                if (res != null && outF.length() > 0) {
-                    src = listOf(outF)
-                    name = swapExt(name, if (res.hasVideo) "mp4" else "m4a")
-                    ok = true
-                } else {
-                    outF.delete()
-                }
-            } catch (e: Exception) {
-            }
-            if (!ok) t.notice = "تعذّر تحويل الملف إلى MP4، حُفظ بصيغته الأصلية وقد لا يدعم التقديم"
-        }
-
-        val mime = Util.mimeOf(name)
+        for (f in files) if (!f.exists() || f.length() == 0L) throw IOException("ملف مؤقت مفقود أو فارغ")
+        val mime = if (t.kind == "hls") {
+            if (name.substringAfterLast('.', "").equals("ts", true)) "video/mp2t" else "video/mp4"
+        } else Util.mimeOf(name)
+        val finalBytes = files.sumOf { it.length() }
         val d = openDest(name, mime)
         try {
             d.out.use { o ->
-                for (f in src) FileInputStream(f).use { it.copyTo(o, 256 * 1024) }
+                for (f in files) FileInputStream(f).use { it.copyTo(o, 256 * 1024) }
             }
             d.finish()
         } catch (e: Exception) {
             try { ctx.contentResolver.delete(d.uri, null, null) } catch (e2: Exception) {}
             throw e
+        } finally {
+            temporaryHlsOutput?.delete()
         }
-        t.total = src.sumOf { it.length() }
+        t.total = finalBytes
         t.savedUri = d.uri.toString()
         t.name = d.name
         t.mime = mime
         dir.deleteRecursively()
     }
+
+    /**
+     * Rebuild an MPEG-TS HLS playlist containing discontinuities. The preferred path
+     * recreates a local VOD manifest with the original EXT-X-DISCONTINUITY boundaries
+     * and lets Media3's HLS pipeline normalize timestamp-adjuster periods. If that
+     * adaptive HLS export is unsupported by a device/source, fall back to a sequential
+     * composition of the already-downloaded TS segments.
+     */
+    @OptIn(UnstableApi::class)
+    private fun rebuildDiscontinuousTransportStream(
+        dir: File,
+        segmentCount: Int,
+        durations: DoubleArray?,
+        discontinuities: BooleanArray?,
+        expectedDurationSec: Double,
+        output: File
+    ) {
+        val safeDurations = durations
+            ?: throw IOException("قائمة مدد مقاطع HLS غير متاحة لإعادة ضبط التوقيت")
+        if (safeDurations.size != segmentCount || safeDurations.any { !it.isFinite() || it <= 0.0 }) {
+            throw IOException("قائمة مدد مقاطع HLS غير مكتملة أو غير صالحة")
+        }
+        val safeDiscontinuities = discontinuities?.takeIf { it.size == segmentCount }
+            ?: throw IOException("حدود EXT-X-DISCONTINUITY غير متاحة لإعادة بناء الفيديو")
+        var downloadedBytes = 0L
+        for (index in 0 until segmentCount) {
+            val segment = File(dir, "s$index")
+            if (!segment.exists() || segment.length() == 0L) {
+                throw IOException("مقطع HLS ${index + 1} مفقود أو فارغ")
+            }
+            downloadedBytes = Math.addExact(downloadedBytes, segment.length())
+        }
+
+        // The source segments must remain available while Transformer writes a new MP4.
+        // Require a conservative amount of free space to avoid a late ENOSPC failure
+        // after a multi-gigabyte export has already started.
+        val requiredFreeBytes = (downloadedBytes.toDouble() * 1.10).toLong() + 128L * 1024L * 1024L
+        val availableBytes = dir.usableSpace
+        if (availableBytes < requiredFreeBytes) {
+            throw IOException(
+                "المساحة الحرة غير كافية لإعادة تجميع فيديو HLS. " +
+                    "المقاطع الحالية: ${formatBytes(downloadedBytes)}، " +
+                    "المساحة الحرة: ${formatBytes(availableBytes)}، " +
+                    "المطلوب التقريبي: ${formatBytes(requiredFreeBytes)}. " +
+                    "حرّر مساحة إضافية ثم أعد المحاولة؛ لن تُحذف المقاطع التي تم تنزيلها."
+            )
+        }
+
+        var manifestFailure: Exception? = null
+        try {
+            val localManifest = writeLocalDiscontinuousPlaylist(
+                dir, segmentCount, safeDurations, safeDiscontinuities
+            )
+            val mediaItem = MediaItem.Builder()
+                .setUri(Uri.fromFile(localManifest))
+                .setMimeType(MimeTypes.APPLICATION_M3U8)
+                .build()
+            output.delete()
+            runTransformerExport(output) { transformer ->
+                transformer.start(mediaItem, output.absolutePath)
+            }
+            verifyHlsDuration(output, expectedDurationSec)
+            return
+        } catch (e: Exception) {
+            manifestFailure = e
+            output.delete()
+        }
+
+        // Fallback: feed each TS segment as an independent item. First try bitstream
+        // passthrough (no quality loss), then allow decoding/encoding if formats differ.
+        val editedItems = ArrayList<EditedMediaItem>(segmentCount)
+        for (index in 0 until segmentCount) {
+            val segment = File(dir, "s$index")
+            val itemBuilder = EditedMediaItem.Builder(
+                MediaItem.Builder()
+                    .setUri(Uri.fromFile(segment))
+                    .setMimeType(MimeTypes.VIDEO_MP2T)
+                    .build()
+            )
+            val durationUs = (safeDurations[index] * 1_000_000.0).toLong().coerceAtLeast(1L)
+            itemBuilder.setDurationUs(durationUs)
+            editedItems.add(itemBuilder.build())
+        }
+        val sequence = EditedMediaItemSequence.withAudioAndVideoFrom(editedItems)
+
+        var passthroughFailure: Exception? = null
+        try {
+            output.delete()
+            val composition = Composition.Builder(sequence)
+                .setTransmuxAudio(true)
+                .setTransmuxVideo(true)
+                .build()
+            runTransformerExport(output) { transformer ->
+                transformer.start(composition, output.absolutePath)
+            }
+            verifyHlsDuration(output, expectedDurationSec)
+            return
+        } catch (e: Exception) {
+            passthroughFailure = e
+            output.delete()
+        }
+
+        try {
+            val composition = Composition.Builder(sequence).build()
+            runTransformerExport(output) { transformer ->
+                transformer.start(composition, output.absolutePath)
+            }
+            verifyHlsDuration(output, expectedDurationSec)
+        } catch (e: Exception) {
+            output.delete()
+            manifestFailure?.let { e.addSuppressed(it) }
+            passthroughFailure?.let { e.addSuppressed(it) }
+            throw IOException(
+                "تعذر إعادة بناء مقاطع MPEG-TS المتقطعة إلى MP4. قد تختلف مسارات/ترميزات المقاطع أو لا يدعم الجهاز أحدها: ${e.message ?: e.javaClass.simpleName}",
+                e
+            )
+        }
+    }
+
+    /** Creates a local VOD HLS manifest, preserving the exact discontinuity boundaries. */
+    private fun writeLocalDiscontinuousPlaylist(
+        dir: File,
+        segmentCount: Int,
+        durations: DoubleArray,
+        discontinuities: BooleanArray
+    ): File {
+        val targetDuration = ceil(durations.maxOrNull() ?: 0.0).toInt().coerceAtLeast(1)
+        val lines = ArrayList<String>(segmentCount * 3 + 8)
+        lines += "#EXTM3U"
+        lines += "#EXT-X-VERSION:3"
+        lines += "#EXT-X-PLAYLIST-TYPE:VOD"
+        lines += "#EXT-X-TARGETDURATION:$targetDuration"
+        lines += "#EXT-X-MEDIA-SEQUENCE:0"
+        for (index in 0 until segmentCount) {
+            if (discontinuities[index]) lines += "#EXT-X-DISCONTINUITY"
+            lines += "#EXTINF:${String.format(Locale.US, "%.6f", durations[index])},"
+            lines += Uri.fromFile(File(dir, "s$index")).toString()
+        }
+        lines += "#EXT-X-ENDLIST"
+        val playlist = File(dir, "hls-local-discontinuous.m3u8")
+        playlist.writeText(lines.joinToString("\n") + "\n", Charsets.UTF_8)
+        return playlist
+    }
+
+    /** Runs Media3 Transformer on its own Looper while the download worker awaits completion. */
+    @OptIn(UnstableApi::class)
+    private fun runTransformerExport(output: File, startExport: (Transformer) -> Unit) {
+        val worker = HandlerThread("HlsDiscontinuityRemux").apply { start() }
+        val handler = Handler(worker.looper)
+        val done = CountDownLatch(1)
+        val failure = AtomicReference<Throwable?>(null)
+        val transformerRef = AtomicReference<Transformer?>(null)
+
+        try {
+            handler.post {
+                try {
+                    val transformer = Transformer.Builder(ctx)
+                        .setLooper(worker.looper)
+                        .addListener(object : Transformer.Listener {
+                            override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                                done.countDown()
+                            }
+
+                            override fun onError(
+                                composition: Composition,
+                                exportResult: ExportResult,
+                                exportException: ExportException
+                            ) {
+                                failure.set(exportException)
+                                done.countDown()
+                            }
+                        })
+                        .build()
+                    transformerRef.set(transformer)
+                    startExport(transformer)
+                } catch (e: Throwable) {
+                    failure.set(e)
+                    done.countDown()
+                }
+            }
+
+            val completed = done.await(12, TimeUnit.HOURS)
+            if (!completed) {
+                handler.post { try { transformerRef.get()?.cancel() } catch (_: Exception) {} }
+                done.await(10, TimeUnit.SECONDS)
+                throw IOException("تجاوزت إعادة بناء الفيديو الحد الزمني الآمن (12 ساعة)، وتم إيقاف العملية دون حذف المقاطع الأصلية")
+            }
+            failure.get()?.let { cause ->
+                throw IOException("فشل Media3 Transformer: ${cause.message ?: cause.javaClass.simpleName}", cause)
+            }
+            if (!output.exists() || output.length() <= 0L) {
+                throw IOException("انتهى تحويل Media3 دون إنشاء ملف MP4 صالح")
+            }
+        } finally {
+            handler.post { try { transformerRef.get()?.removeAllListeners() } catch (_: Exception) {} }
+            worker.quitSafely()
+            try { worker.join(5_000L) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+        }
+    }
+
+    /**
+     * Concatenate MPEG-TS HLS media segments without changing their transport-stream
+     * packet payload. Each segment is checked for 188-byte packet alignment and sync
+     * bytes first; malformed/truncated data is rejected instead of being saved.
+     */
+    private fun concatenateHlsTransportStream(dir: File, segmentCount: Int, output: File) {
+        var expectedSize = 0L
+        for (index in 0 until segmentCount) {
+            val segment = File(dir, "s$index")
+            if (!segment.exists() || segment.length() < 188L || segment.length() % 188L != 0L) {
+                throw IOException("مقطع HLS ${index + 1} ليس MPEG-TS مكتملًا (حجم الحزم غير صحيح)")
+            }
+            DataInputStream(BufferedInputStream(FileInputStream(segment))).use { input ->
+                val packet = ByteArray(188)
+                var packetIndex = 0
+                while (true) {
+                    val first = input.read()
+                    if (first < 0) break
+                    packet[0] = first.toByte()
+                    try { input.readFully(packet, 1, 187) }
+                    catch (e: EOFException) { throw IOException("مقطع HLS ${index + 1} ينتهي بحزمة TS ناقصة", e) }
+                    if ((packet[0].toInt() and 0xff) != 0x47) {
+                        throw IOException("مقطع HLS ${index + 1} لا يحتوي تزامن MPEG-TS صالحًا عند الحزمة ${packetIndex + 1}")
+                    }
+                    packetIndex++
+                }
+            }
+            expectedSize += segment.length()
+        }
+        FileOutputStream(output).use { out ->
+            for (index in 0 until segmentCount) {
+                FileInputStream(File(dir, "s$index")).use { it.copyTo(out, 256 * 1024) }
+            }
+            out.fd.sync()
+        }
+        if (!output.exists() || output.length() != expectedSize) {
+            output.delete()
+            throw IOException("تعذر التحقق من اكتمال ملف MPEG-TS المجمع")
+        }
+    }
+
+    private fun withExtension(name: String, ext: String): String {
+        val base = name.substringBeforeLast('.', name).ifBlank { "video" }
+        return "$base.$ext"
+    }
+
+    /**
+     * Remux HLS segments individually into a normal indexed MP4. Segment-local
+     * timestamps are shifted onto the playlist timeline, so discontinuous TS/fMP4
+     * timestamp origins do not make the final duration collapse or go backwards.
+     */
+    private fun remuxHlsSegmentsToMp4(
+        dir: File,
+        segmentCount: Int,
+        durations: DoubleArray?,
+        expectedDurationSec: Double,
+        output: File
+    ) {
+        var muxer: MediaMuxer? = null
+        var muxerStarted = false
+        val outputTrackBySourceOrder = ArrayList<Int>()
+        val maxPtsByOutputTrack = ArrayList<Long>()
+        var referenceSignatures: List<String>? = null
+        var timelineUs = 0L
+        val bufferInfo = MediaCodec.BufferInfo()
+        var sharedBuffer: ByteBuffer? = null
+
+        try {
+            for (segmentIndex in 0 until segmentCount) {
+                val segment = File(dir, "s$segmentIndex")
+                if (!segment.exists() || segment.length() == 0L) throw IOException("مقطع HLS ${segmentIndex + 1} مفقود")
+                val init = File(dir, "init")
+                val source = if (init.exists()) {
+                    val joined = File(dir, "hls-segment-$segmentIndex.tmp")
+                    FileOutputStream(joined).use { out ->
+                        FileInputStream(init).use { it.copyTo(out, 256 * 1024) }
+                        FileInputStream(segment).use { it.copyTo(out, 256 * 1024) }
+                        out.fd.sync()
+                    }
+                    joined
+                } else segment
+
+                try {
+                    // First pass: get the track layout and the earliest timestamp in
+                    // this segment without retaining sample data in memory.
+                    val probe = MediaExtractor()
+                    val sourceTracks: List<Int>
+                    val signatures: List<String>
+                    val firstPtsBySource = HashMap<Int, Long>()
+                    try {
+                        probe.setDataSource(source.absolutePath)
+                        sourceTracks = (0 until probe.trackCount).filter { index ->
+                            val mime = probe.getTrackFormat(index).getString(MediaFormat.KEY_MIME) ?: ""
+                            mime.startsWith("video/") || mime.startsWith("audio/")
+                        }
+                        if (sourceTracks.isEmpty()) throw IOException("مقطع HLS ${segmentIndex + 1} لا يحتوي مسارات صوت/فيديو قابلة للقراءة")
+                        signatures = sourceTracks.map { mediaFormatSignature(probe.getTrackFormat(it)) }
+                        sourceTracks.forEach { probe.selectTrack(it) }
+                        while (probe.sampleTrackIndex >= 0) {
+                            val track = probe.sampleTrackIndex
+                            val pts = probe.sampleTime
+                            if (pts >= 0L && !firstPtsBySource.containsKey(track)) firstPtsBySource[track] = pts
+                            if (!probe.advance()) break
+                        }
+                    } finally {
+                        probe.release()
+                    }
+                    if (sourceTracks.any { !firstPtsBySource.containsKey(it) }) {
+                        throw IOException("المقطع ${segmentIndex + 1} لا يحتوي توقيتًا صالحًا لكل المسارات")
+                    }
+
+                    if (muxer == null) {
+                        val setup = MediaExtractor()
+                        try {
+                            setup.setDataSource(source.absolutePath)
+                            muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                            for (sourceTrack in sourceTracks) {
+                                val outputTrack = muxer!!.addTrack(setup.getTrackFormat(sourceTrack))
+                                outputTrackBySourceOrder.add(outputTrack)
+                                maxPtsByOutputTrack.add(-1L)
+                            }
+                            muxer!!.start()
+                            muxerStarted = true
+                            referenceSignatures = signatures
+                        } finally {
+                            setup.release()
+                        }
+                    } else if (signatures != referenceSignatures) {
+                        throw IOException("تغيّر ترميز أو عدد مسارات HLS بين المقاطع؛ أُوقف الدمج كي لا ينتج ملف صوت/فيديو تالف")
+                    }
+
+                    // Compute one shared offset for A/V sync. If the playlist duration
+                    // overlaps a previous segment by a few ticks, move the whole segment
+                    // forward just enough to keep each track chronological.
+                    val minFirstPts = sourceTracks.minOf { firstPtsBySource.getValue(it) }
+                    var offsetUs = timelineUs - minFirstPts
+                    for (index in sourceTracks.indices) {
+                        val first = firstPtsBySource.getValue(sourceTracks[index]) + offsetUs
+                        val previousMax = maxPtsByOutputTrack[index]
+                        if (previousMax >= 0L && first <= previousMax) {
+                            offsetUs = maxOf(offsetUs, previousMax + 1L - firstPtsBySource.getValue(sourceTracks[index]))
+                        }
+                    }
+                    val actualSegmentStartUs = minFirstPts + offsetUs
+
+                    val extractor = MediaExtractor()
+                    try {
+                        extractor.setDataSource(source.absolutePath)
+                        sourceTracks.forEach { extractor.selectTrack(it) }
+                        val maxInputSize = sourceTracks.mapNotNull { track ->
+                            val format = extractor.getTrackFormat(track)
+                            try { format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE) } catch (_: Exception) { null }
+                        }.maxOrNull() ?: 0
+                        val capacity = (maxInputSize.toLong() + 64L * 1024L)
+                            .coerceIn(4L * 1024L * 1024L, 32L * 1024L * 1024L).toInt()
+                        val buffer: ByteBuffer = if (sharedBuffer != null && sharedBuffer!!.capacity() >= capacity) sharedBuffer!!
+                        else ByteBuffer.allocateDirect(capacity).also { sharedBuffer = it }
+                        while (true) {
+                            buffer.clear()
+                            val size = extractor.readSampleData(buffer, 0)
+                            if (size < 0) break
+                            val sourceTrack = extractor.sampleTrackIndex
+                            val sourceOrder = sourceTracks.indexOf(sourceTrack)
+                            if (sourceOrder < 0) {
+                                if (!extractor.advance()) break
+                                continue
+                            }
+                            if (size > buffer.capacity()) throw IOException("إطار فيديو يتجاوز الحد الآمن للذاكرة المؤقتة")
+                            val sourcePts = extractor.sampleTime
+                            if (sourcePts < 0L) throw IOException("توقيت إطار غير صالح في المقطع ${segmentIndex + 1}")
+                            val outputTrack = outputTrackBySourceOrder[sourceOrder]
+                            val outputPts = sourcePts + offsetUs
+                            // Samples can be emitted in decode order while presentation
+                            // timestamps move backwards for B-frames. MediaMuxer supports
+                            // B-frame MP4 output, so preserve extractor sample order and
+                            // track the maximum PTS only for the next segment boundary.
+                            buffer.position(0)
+                            buffer.limit(size)
+                            val muxFlags = if ((extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0)
+                                MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                            bufferInfo.set(0, size, outputPts, muxFlags)
+                            muxer!!.writeSampleData(outputTrack, buffer, bufferInfo)
+                            maxPtsByOutputTrack[outputTrack] = maxOf(maxPtsByOutputTrack[outputTrack], outputPts)
+                            if (!extractor.advance()) break
+                        }
+                    } finally {
+                        extractor.release()
+                    }
+
+                    val duration = durations?.getOrNull(segmentIndex)?.takeIf { it > 0.0 }
+                        ?: if (expectedDurationSec > 0.0) expectedDurationSec / segmentCount else 0.0
+                    timelineUs = maxOf(timelineUs, actualSegmentStartUs) + (duration * 1_000_000.0).toLong()
+                } finally {
+                    if (source != segment) source.delete()
+                }
+            }
+
+            if (muxer == null || !muxerStarted || maxPtsByOutputTrack.isEmpty()) {
+                throw IOException("لم يتم استخراج أي مسار صالح من فيديو HLS")
+            }
+            if (expectedDurationSec > 0.0) {
+                val endUs = (expectedDurationSec * 1_000_000.0).toLong()
+                val lastSegmentDuration = durations?.lastOrNull()?.takeIf { it > 0.0 } ?: 0.0
+                val allowedTail = (maxOf(10.0, lastSegmentDuration + 2.0) * 1_000_000.0).toLong()
+                if (maxPtsByOutputTrack.any { it < 0L || it + allowedTail < endUs }) {
+                    throw IOException("بيانات أحد مسارات الصوت/الفيديو تنتهي قبل المدة المعلنة في قائمة HLS؛ رُفض الملف بدل إخفاء النقص بتمديد آخر إطار")
+                }
+            }
+            muxer!!.stop()
+            muxerStarted = false
+            if (!output.exists() || output.length() <= 0L) throw IOException("فشل إنشاء ملف MP4 النهائي")
+        } catch (e: Exception) {
+            output.delete()
+            if (e is IOException) throw e
+            throw IOException("تعذر إعادة بناء مقاطع HLS إلى MP4 قابل للتقديم والتأخير: ${e.message ?: e.javaClass.simpleName}", e)
+        } finally {
+            if (muxerStarted) try { muxer?.stop() } catch (_: Exception) {}
+            try { muxer?.release() } catch (_: Exception) {}
+        }
+    }
+
+    private fun mediaFormatSignature(format: MediaFormat): String {
+        val keys = listOf(
+            MediaFormat.KEY_MIME, MediaFormat.KEY_WIDTH, MediaFormat.KEY_HEIGHT,
+            MediaFormat.KEY_SAMPLE_RATE, MediaFormat.KEY_CHANNEL_COUNT,
+            MediaFormat.KEY_PROFILE, MediaFormat.KEY_LEVEL
+        )
+        val values = keys.joinToString("|") { key ->
+            val stringValue = try { format.getString(key) } catch (_: Exception) { null }
+            val intValue = if (stringValue == null) try { format.getInteger(key).toString() } catch (_: Exception) { "" } else ""
+            "$key=${stringValue ?: intValue}"
+        }
+        val csd = (0..2).joinToString("|") { index ->
+            try {
+                val data = format.getByteBuffer("csd-$index")?.duplicate() ?: return@joinToString ""
+                val bytes = ByteArray(data.remaining())
+                data.get(bytes)
+                bytes.joinToString("") { b -> "%02x".format(b) }
+            } catch (_: Exception) { "" }
+        }
+        return "$values|$csd"
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        val mb = bytes.toDouble() / (1024.0 * 1024.0)
+        return if (mb >= 1024.0) String.format(Locale.US, "%.2f GB", mb / 1024.0)
+        else String.format(Locale.US, "%.0f MB", mb)
+    }
+
+    private fun verifyHlsDuration(file: File, expectedSeconds: Double) {
+        if (expectedSeconds <= 0.0) return
+        val retriever = MediaMetadataRetriever()
+        val durationMs: Long
+        try {
+            retriever.setDataSource(file.absolutePath)
+            durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+                ?: throw IOException("تعذر قراءة مدة ملف MP4 الناتج")
+        } catch (e: Exception) {
+            if (e is IOException) throw e
+            throw IOException("تعذر التحقق من مدة ملف MP4 الناتج", e)
+        } finally {
+            try { retriever.release() } catch (_: Exception) {}
+        }
+        val actual = durationMs / 1000.0
+        val tolerance = maxOf(8.0, expectedSeconds * 0.03)
+        if (actual + tolerance < expectedSeconds) {
+            throw IOException("الملف الناتج أقصر من مدة قائمة HLS (المتوقع ${expectedSeconds.toInt()} ثانية، الناتج ${actual.toInt()} ثانية). أُوقف الحفظ لتجنب ملف بمدة وهمية")
+        }
+        if (actual - tolerance > expectedSeconds) {
+            throw IOException("مدة الملف الناتج لا تطابق مدة قائمة HLS (المتوقع ${expectedSeconds.toInt()} ثانية، الناتج ${actual.toInt()} ثانية). أُوقف الحفظ لحماية الملف من التوقيتات غير السليمة")
+        }
+    }
+
 }

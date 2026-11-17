@@ -703,6 +703,7 @@ class MainActivity : AppCompatActivity() {
                 .putExtra("names", arrayOf(title))
                 .putExtra("headers", h.toTypedArray())
                 .putExtra("hls", f.kind == "hls")
+                .putExtra("ext", f.ext)
         )
     }
 

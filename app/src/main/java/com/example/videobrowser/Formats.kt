@@ -41,7 +41,9 @@ object Formats {
         val m = Hls.parseMedia(Net.fetchText(url, h), url)
         if (m.segs.isEmpty()) throw IOException("empty")
         val s0 = m.segs[0]
-        var data = Net.readBytes(s0.url, h)
+        var data = if (s0.rangeStart != null && s0.rangeLength != null)
+            Net.readRangeBytes(s0.url, h, s0.rangeStart, s0.rangeLength)
+        else Net.readBytes(s0.url, h)
         val size0 = data.size
         var w = 0
         var hh = 0
@@ -49,8 +51,16 @@ object Formats {
             try {
                 val k = s0.keyUri
                 if (k != null) data = Hls.decrypt(data, Net.readBytes(k, h), s0.iv, s0.seq)
-                val iu = m.initUrl
-                val r = if (iu != null) Sps.fromAvcC(Net.readBytes(iu, h)) else Sps.fromTs(data)
+                val init = m.init
+                var initData = if (init != null) {
+                    if (init.rangeStart != null && init.rangeLength != null)
+                        Net.readRangeBytes(init.url, h, init.rangeStart, init.rangeLength)
+                    else Net.readBytes(init.url, h)
+                } else null
+                if (initData != null && init?.keyUri != null) {
+                    initData = Hls.decrypt(initData!!, Net.readBytes(init.keyUri, h), init.iv, 0L)
+                }
+                val r = if (initData != null) Sps.fromAvcC(initData) else Sps.fromTs(data)
                 if (r != null) { w = r[0]; hh = r[1] }
             } catch (e: Exception) {
             }
@@ -112,7 +122,7 @@ object Formats {
                 out.add(
                     Format(
                         label, inf.w.toString() + "x" + inf.h, item.url, "hls",
-                        if (m0.initUrl != null) "mp4" else "ts", false, fmtEst(inf.bytes), false, inf.duration
+                        if (m0.init != null) "mp4" else "ts", false, fmtEst(inf.bytes), false, inf.duration
                     )
                 )
             }

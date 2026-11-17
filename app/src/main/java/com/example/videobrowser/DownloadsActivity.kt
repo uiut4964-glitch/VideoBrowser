@@ -311,7 +311,7 @@ class DownloadsActivity : AppCompatActivity() {
 
         if (t.status == St.DONE) {
             h.bar.visibility = View.GONE
-            h.info.text = Util.fmtSize(t.total) + (if (t.notice.isNotEmpty()) "\n" + t.notice else "")
+            h.info.text = Util.fmtSize(t.total)
             h.info.setTextColor(0xFF78909C.toInt())
             val d = th?.durMs ?: 0L
             h.dur.visibility = if (d > 0) View.VISIBLE else View.GONE
@@ -569,18 +569,11 @@ class DownloadsActivity : AppCompatActivity() {
                     pm.menu.add(0, 1, 0, when (Util.kindOf(t.name)) { "apk" -> "تثبيت"; "video", "audio" -> "تشغيل"; else -> "فتح" })
                     pm.menu.add(0, 2, 1, "مشاركة")
                     pm.menu.add(0, 3, 2, "حذف")
-                    if (Util.kindOf(t.name) == "video") pm.menu.add(0, 4, 3, "إصلاح الملف (التقديم والمدة)")
                     pm.setOnMenuItemClickListener { mi ->
                         when (mi.itemId) {
                             1 -> play(t)
                             2 -> share(t)
                             3 -> confirm("حذف الملف من الجهاز؟") { DownloadCenter.deleteFinished(t) }
-                            4 -> {
-                                Toast.makeText(c, "جارٍ إصلاح الملف، قد يستغرق دقائق للملفات الكبيرة", Toast.LENGTH_LONG).show()
-                                DownloadCenter.repair(t) { ok ->
-                                    Toast.makeText(c, if (ok) "تم إصلاح الملف" else "تعذّر إصلاح الملف", Toast.LENGTH_LONG).show()
-                                }
-                            }
                         }
                         true
                     }

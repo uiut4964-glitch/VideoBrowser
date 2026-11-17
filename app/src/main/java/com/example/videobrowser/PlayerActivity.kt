@@ -102,10 +102,14 @@ class PlayerActivity : AppCompatActivity() {
         val p = builder.build()
         player = p
         pv.player = p
+        val fallbackExt = intent.getStringExtra("ext")?.lowercase().orEmpty()
         p.setMediaItems(
-            uris.map {
-                if (isHls) ExoItem.Builder().setUri(it).setMimeType(MimeTypes.APPLICATION_M3U8).build()
-                else ExoItem.fromUri(it)
+            uris.mapIndexed { itemIndex, uri ->
+                val itemBuilder = ExoItem.Builder().setUri(uri)
+                val mime = if (isHls) MimeTypes.APPLICATION_M3U8
+                    else mimeForDownloadedName(names.getOrNull(itemIndex).orEmpty(), fallbackExt)
+                if (mime != null) itemBuilder.setMimeType(mime)
+                itemBuilder.build()
             },
             index, 0L
         )
@@ -125,6 +129,29 @@ class PlayerActivity : AppCompatActivity() {
         val c = WindowCompat.getInsetsController(window, window.decorView)
         c.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         c.hide(WindowInsetsCompat.Type.systemBars())
+    }
+
+    /**
+     * Content URIs often hide their filename extension. Supplying the MIME type
+     * avoids extractor mis-detection, especially for downloaded MP4/TS containers.
+     */
+    private fun mimeForDownloadedName(name: String, fallbackExt: String): String? {
+        val ext = name.substringAfterLast('.', "").lowercase().ifBlank { fallbackExt }
+        return when (ext) {
+            "mp4", "m4v", "m4a", "mov" -> if (ext == "m4a") "audio/mp4" else "video/mp4"
+            "3gp", "3gpp" -> "video/3gpp"
+            "ts", "m2ts", "mts" -> "video/mp2t"
+            "webm" -> "video/webm"
+            "mkv", "matroska" -> "video/x-matroska"
+            "mp3" -> "audio/mpeg"
+            "aac" -> "audio/aac"
+            "ogg", "oga", "opus" -> "audio/ogg"
+            "wav" -> "audio/wav"
+            "flac" -> "audio/flac"
+            "avi" -> "video/avi"
+            "mpg", "mpeg" -> "video/mpeg"
+            else -> null
+        }
     }
 
     override fun onStop() {

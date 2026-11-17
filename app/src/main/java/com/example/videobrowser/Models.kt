@@ -43,6 +43,10 @@ class Task(
     var created = System.currentTimeMillis()
     var mime = "video/mp4"
     var segCount = 0
+    @Volatile var expectedDurationSec = 0.0
+    @Volatile var segmentDurations: DoubleArray? = null
+    @Volatile var segmentDiscontinuities: BooleanArray? = null
+    @Volatile var hasHlsDiscontinuity = false
     var rangeOk = false
     var thumbUrl = ""
     @Volatile var partDone: LongArray? = null
