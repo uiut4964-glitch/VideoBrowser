@@ -59,27 +59,54 @@ import java.io.File
 import java.net.URL
 import java.net.URLEncoder
 import java.util.UUID
+import java.util.concurrent.Callable
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
 private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
-// يبحث عن الفيديو الذي يُشغَّل فعليًا (الأكبر ظهورًا على الشاشة) ويتجاهل المعاينات
-private const val SCAN_JS =
-    "(function(){var vs=document.querySelectorAll('video'),best=null,bs=-1,others=[];" +
-        "var vw=window.innerWidth,vh=window.innerHeight;" +
-        "for(var i=0;i<vs.length;i++){var v=vs[i];if(!v.__vid)v.__vid=Math.random().toString(36).slice(2);" +
-        "var s0=v.currentSrc||v.src||'';var r=v.getBoundingClientRect();" +
-        "var w=Math.max(0,Math.min(r.right,vw)-Math.max(r.left,0));" +
-        "var h=Math.max(0,Math.min(r.bottom,vh)-Math.max(r.top,0));var area=w*h;" +
-        "var playing=!v.paused&&!v.ended&&v.readyState>2;" +
-        "if(area<1||(!playing&&!(v.currentTime>1))){if(s0)others.push(s0);continue;}" +
-        "var sc=area*(playing?4:1)*(v.muted?1:2);" +
-        "if(sc>bs){if(best&&best.src)others.push(best.src);bs=sc;best={id:v.__vid,src:s0,poster:v.poster||''};}" +
-        "else if(s0)others.push(s0);}" +
-        "var og=document.querySelector('meta[property=\"og:image\"]');" +
-        "return JSON.stringify({n:vs.length,a:best,o:others,og:og?og.content:''});})()"
+// يحدد الفيديو الرئيسي في الصفحة (الأكبر مساحة، حتى قبل التشغيل) ويتجاهل المصغّرات والمعاينات،
+// ويقرأ الروابط المعلنة في الصفحة (og:video و JSON-LD) لتجهيز الجودات قبل التشغيل.
+private const val SCAN_JS = """(function(){
+var vs=document.querySelectorAll('video'),best=null,bs=-1,others=[];
+for(var i=0;i<vs.length;i++){var v=vs[i];var s0=v.currentSrc||v.src||'';
+if(!s0){var so=v.querySelector('source');if(so&&so.src)s0=so.src;}
+var r=v.getBoundingClientRect();var area=Math.max(0,r.width)*Math.max(0,r.height);
+var playing=!v.paused&&!v.ended&&v.readyState>2;
+if(area<20000){if(s0)others.push(s0);continue;}
+var sc=area*(playing?2:1);
+if(sc>bs){if(best&&best.src)others.push(best.src);bs=sc;best={src:s0,poster:v.poster||'',dur:v.duration||0};}
+else if(s0)others.push(s0);}
+var meta=[];
+function add(u){if(u&&typeof u==='string'&&/^https?:/.test(u))meta.push(u);}
+var sel=['meta[property="og:video"]','meta[property="og:video:url"]','meta[property="og:video:secure_url"]','meta[name="twitter:player:stream"]'];
+for(var k=0;k<sel.length;k++){var m=document.querySelector(sel[k]);if(m)add(m.content);}
+var ld=document.querySelectorAll('script[type="application/ld+json"]');
+for(var q=0;q<ld.length;q++){try{var j=JSON.parse(ld[q].textContent);(Array.isArray(j)?j:[j]).forEach(function(x){if(x&&x.contentUrl)add(x.contentUrl);});}catch(e){}}
+var og=document.querySelector('meta[property="og:image"]');
+return JSON.stringify({n:vs.length,a:best,o:others,m:meta,og:og?og.content:''});})()"""
+
+private val AD_HOST_PARTS = listOf(
+    "doubleclick.", "googlesyndication.", "googleadservices.", "2mdn.net", "imasdk.", "moatads.", "adnxs.",
+    "adsrvr.", "adform.", "criteo.", "pubmatic.", "rubiconproject.", "openx.", "smartadserver.", "spotxchange.",
+    "springserve.", "taboola.", "outbrain.", "exoclick.", "trafficjunky.", "juicyads.", "popads.", "propellerads.",
+    "mgid.", "revcontent.", "teads.", "tremorhub.", "freewheel.", "fwmrm.net", "innovid.", "adcolony.",
+    "unityads.", "applovin.", "vungle.", "mopub.", "inmobi.", "chartboost.", "adsafeprotected.", "serving-sys.",
+    "amazon-adsystem.", "adtng.", "tsyndicate.", "clickadu.", "hilltopads."
+)
+private val AD_PATH_REGEX = Regex("(?i)(^|[/_.-])(ads?|adserver|adserving|advert|adverts|advertising|preroll|pre-roll|midroll|postroll|vast|vmap)([/_.?=&-]|$)")
+
+/** هل هذا الرابط يعود لشبكة إعلانات أو مسار إعلاني معروف؟ */
+private fun isAdUrl(url: String): Boolean {
+    val u = url.lowercase()
+    val host = try { URL(u).host ?: "" } catch (e: Exception) { "" }
+    if (AD_HOST_PARTS.any { host.contains(it) }) return true
+    if (host.split('.').any { it == "ads" || it == "adserver" || it == "adservice" || it == "adtech" || it == "adsystem" || it.startsWith("ads-") || it.startsWith("adserv") }) return true
+    val path = try { URL(u).path ?: "" } catch (e: Exception) { u }
+    return AD_PATH_REGEX.containsMatchIn(path)
+}
 
 private const val DESKTOP_UA =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -102,6 +129,8 @@ class MainActivity : AppCompatActivity() {
         var playStart = 0L
         var poster = ""
         var lastForced = ""
+        val main = LinkedHashSet<String>()
+        val excluded = HashSet<String>()
     }
 
     private val tabs = ArrayList<Tab>()
@@ -187,6 +216,17 @@ class MainActivity : AppCompatActivity() {
         }
         setContentView(buildUi())
         CookieManager.getInstance().setAcceptCookie(true)
+        try {
+            // طلبات Service Worker لا تمر على WebViewClient، فنراقبها هنا أيضًا
+            android.webkit.ServiceWorkerController.getInstance().setServiceWorkerClient(object : android.webkit.ServiceWorkerClient() {
+                override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? {
+                    val u = request.url.toString()
+                    if (isMediaUrl(u)) ui.post { cur?.let { rec(it, u) } }
+                    return null
+                }
+            })
+        } catch (e: Exception) {
+        }
         restoreTabs(intent?.data?.toString())
         handleRefreshIntent(intent)
 
@@ -382,10 +422,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateFab() {
-        val n = cur?.media?.size ?: 0
-        (fabIcon.background as GradientDrawable).setColor(if (n > 0) 0xFFE53935.toInt() else 0xFF78909C.toInt())
-        badge.visibility = if (n > 0) View.VISIBLE else View.GONE
-        badge.text = n.toString()
+        val has = cur?.let { candidatesOf(it).isNotEmpty() } ?: false
+        (fabIcon.background as GradientDrawable).setColor(if (has) 0xFFE53935.toInt() else 0xFF78909C.toInt())
+        badge.visibility = View.GONE
     }
 
     // ---------------------------------------------------------------- التبويبات
@@ -497,6 +536,8 @@ class MainActivity : AppCompatActivity() {
                 val t = tabOf(v) ?: return
                 t.url = url
                 t.media.clear()
+                t.main.clear()
+                t.excluded.clear()
                 t.sniffed.clear()
                 t.activeId = null
                 t.sawBlob = false
@@ -575,15 +616,29 @@ class MainActivity : AppCompatActivity() {
         Store.putEntries(this, "history", l)
     }
 
-    // ---------------------------------------------------------------- كشف الفيديو الذي يُشغَّل فعليًا
+    // ---------------------------------------------------------------- كشف الفيديو الرئيسي
+    private fun isMediaUrl(u: String) = MEDIA_REGEX.containsMatchIn(u) || u.contains("videoplayback")
+
     private fun rec(t: Tab, url: String) {
         if (t.sniffed.containsKey(url)) return
         t.sniffed[url] = System.currentTimeMillis()
         if (t.sniffed.size > 80) t.sniffed.remove(t.sniffed.keys.first())
     }
 
-    private fun addTo(t: Tab, url: String) {
-        t.media[url] = MediaItem(url, if (url.contains(".m3u8", true)) "hls" else "direct")
+    /**
+     * المرشحون للتحميل: الفيديو الرئيسي المعلن في الصفحة أولًا، ثم ما التُقط من الشبكة (الأحدث أولًا)،
+     * بعد حذف الإعلانات ومصادر المعاينات. لا يُمسح شيء عند انتهاء الإعلان، فالاختيار يتم عند الضغط على الزر.
+     */
+    private fun candidatesOf(t: Tab): List<MediaItem> {
+        val out = LinkedHashMap<String, MediaItem>()
+        fun put(u: String) {
+            if (u.startsWith("http") && !isAdUrl(u) && !t.excluded.contains(u) && out.size < 8) {
+                out[u] = MediaItem(u, if (u.contains(".m3u8", true)) "hls" else "direct")
+            }
+        }
+        for (u in t.main) put(u)
+        for (u in t.sniffed.keys.reversed()) put(u)
+        return out.values.toList()
     }
 
     private fun scan(t: Tab) {
@@ -600,42 +655,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onScan(t: Tab, o: JSONObject) {
-        val n = o.optInt("n")
-        val a = o.optJSONObject("a")
-        val others = HashSet<String>()
         val oa = o.optJSONArray("o")
-        if (oa != null) for (i in 0 until oa.length()) others.add(oa.getString(i))
-
-        if (a == null) {
-            t.activeId = null
-            t.media.clear()
-            if (n == 0) {
-                // لا يوجد عنصر فيديو في الصفحة نفسها (قد يكون داخل iframe): نعرض آخر ما التُقط حديثًا
-                val now = System.currentTimeMillis()
-                for ((u, ts) in t.sniffed) if (now - ts < 90000) addTo(t, u)
-            }
-            updateFab()
-            return
-        }
-        val id = a.getString("id")
-        if (id != t.activeId) {
-            t.activeId = id
-            t.playStart = System.currentTimeMillis()
-        }
-        val src = a.optString("src")
-        t.poster = a.optString("poster").ifEmpty { o.optString("og") }
-        t.media.clear()
-        if (src.startsWith("http")) {
-            addTo(t, src)
-        } else {
+        if (oa != null) for (i in 0 until oa.length()) t.excluded.add(oa.getString(i))
+        val a = o.optJSONObject("a")
+        if (a != null) {
+            val src = a.optString("src")
+            t.poster = a.optString("poster").ifEmpty { o.optString("og") }
             if (src.startsWith("blob:")) t.sawBlob = true
-            val cand = t.sniffed.filter { !others.contains(it.key) }
-            val recent = cand.filter { it.value >= t.playStart - 5000 }
-            val pick = LinkedHashMap<String, Long>()
-            pick.putAll(if (recent.isNotEmpty()) recent else cand)
-            // القائمة الرئيسية لبث m3u8 تُطلب عادةً قبل بدء التشغيل، فنُبقيها دائمًا ضمن المرشحين
-            for ((u, ts) in cand) if (u.contains(".m3u8", true)) pick[u] = ts
-            for (u in pick.keys) addTo(t, u)
+            if (src.startsWith("http") && !isAdUrl(src)) t.main.add(src)
+        } else {
+            t.poster = o.optString("og")
+        }
+        val ma = o.optJSONArray("m")
+        if (ma != null) for (i in 0 until ma.length()) {
+            val u = ma.getString(i)
+            if (!isAdUrl(u)) t.main.add(u)
         }
         updateFab()
     }
@@ -656,28 +690,45 @@ class MainActivity : AppCompatActivity() {
 
     private fun onFabClick() {
         val t = cur ?: return
-        if (t.media.isEmpty()) {
+        val items = candidatesOf(t)
+        if (items.isEmpty()) {
             toast(
                 if (t.sawBlob) "هذا الموقع يستخدم بثًا محميًا لا يمكن تحميله مباشرة"
-                else "لم أجد فيديو قيد التشغيل. شغّل الفيديو الذي تريده أولًا ثم اضغط الزر"
+                else "لم أجد فيديو في هذه الصفحة بعد. افتح الفيديو أو شغّله ثم اضغط الزر"
             )
             return
         }
-        toast("جارٍ جلب الصيغ المتاحة...")
-        val items = t.media.values.toList()
+        toast("جارٍ تجهيز الجودات المتاحة...")
         val headers = headersFor(t)
         val title = if (t.title.isBlank()) Util.host(t.url) else t.title
         val poster = t.poster
         io.execute {
-            val list = ArrayList<Format>()
-            for (item in items) {
-                try { list.addAll(Formats.resolve(item, headers)) } catch (e: Exception) {}
+            val pool = Executors.newFixedThreadPool(minOf(4, items.size))
+            val futures = items.map { item ->
+                pool.submit(Callable<List<Format>> {
+                    try { Formats.resolve(item, headers) } catch (e: Exception) { emptyList() }
+                })
             }
-            val clean = list.filter { f -> f.fromMaster || list.none { it.fromMaster && it.url == f.url } }
-                .distinctBy { it.url }
+            val groups = futures.map { f ->
+                try { f.get(25, TimeUnit.SECONDS) } catch (e: Exception) { emptyList<Format>() }
+            }
+            pool.shutdownNow()
+
+            // روابط الجودات الفرعية التي ظهرت أيضًا كعناصر مستقلة تُحذف
+            val variantUrls = groups.flatMap { g -> g.filter { it.fromMaster }.map { it.url } }.toSet()
+            val cleaned = groups.map { g -> g.filter { it.fromMaster || it.url !in variantUrls } }.filter { it.isNotEmpty() }
+
+            // الفيديو الرئيسي هو أكبر مجموعة (بالحجم المقدّر، وإلا بالمدة): الإعلانات والمعاينات أصغر منه
+            fun score(g: List<Format>): Double {
+                val b = g.maxOfOrNull { it.bytes }?.toDouble() ?: 0.0
+                return if (b > 0) b else (g.maxOfOrNull { it.durSec } ?: 0.0)
+            }
+            val best = cleaned.maxByOrNull { score(it) }
+            val shortClip = best != null && best.all { it.durSec > 0 } && (best.maxOfOrNull { it.durSec } ?: 0.0) in 0.1..40.0
+            val note = if (shortClip) "مدة قصيرة: ربما هذا إعلان. انتظر انتهاءه ثم اضغط الزر مرة أخرى" else ""
             ui.post {
                 if (isFinishing) return@post
-                if (clean.isEmpty()) toast("تعذر جلب معلومات الفيديو") else showFormatSheet(clean, headers, title, poster)
+                if (best == null) toast("تعذر جلب معلومات الفيديو") else showFormatSheet(best, headers, title, poster, note)
             }
         }
     }
@@ -707,7 +758,7 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun showFormatSheet(list: List<Format>, headers: Map<String, String>, title: String, poster: String) {
+    private fun showFormatSheet(list: List<Format>, headers: Map<String, String>, title: String, poster: String, note: String = "") {
         val dlg = BottomSheetDialog(this)
         val gray = 0xFF78909C.toInt()
         val red = 0xFFE53935.toInt()
@@ -759,6 +810,9 @@ class MainActivity : AppCompatActivity() {
             textSize = 12f
             setTextColor(gray)
         })
+        if (note.isNotEmpty()) {
+            infoCol.addView(TextView(this).apply { text = note; textSize = 12f; setTextColor(0xFFE65100.toInt()) })
+        }
         val et = EditText(this).apply {
             setText(title)
             textSize = 15f
