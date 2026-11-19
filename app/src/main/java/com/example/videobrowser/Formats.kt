@@ -2,6 +2,9 @@ package com.example.videobrowser
 
 import java.io.IOException
 import java.util.Locale
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 object Formats {
     private val exts = setOf("mp4", "m4v", "webm", "mkv", "mov", "flv", "3gp", "mp3", "m4a", "aac", "ogg", "wav")
@@ -69,6 +72,86 @@ object Formats {
         return Info(m.duration, bytes, w, hh)
     }
 
+    /** يبحث عن master.m3u8 / index.m3u8 ... في مجلد القائمة ومجلدها الأب */
+    private fun discoverMaster(url: String, h: Map<String, String>): String? {
+        val noQuery = url.substringBefore('?')
+        val query = if (url.contains('?')) "?" + url.substringAfter('?') else ""
+        val dir1 = noQuery.substringBeforeLast('/')
+        val dir2 = dir1.substringBeforeLast('/', "")
+        val names = listOf("master.m3u8", "index.m3u8", "playlist.m3u8", "main.m3u8")
+        val cands = LinkedHashSet<String>()
+        for (d in listOf(dir1, dir2)) {
+            if (d.startsWith("http") && d.count { it == '/' } >= 3) {
+                for (n in names) {
+                    val c = "$d/$n"
+                    if (c != noQuery) cands.add(c + query)
+                }
+            }
+        }
+        if (cands.isEmpty()) return null
+        val list = cands.take(8)
+        val pool = Executors.newFixedThreadPool(4)
+        try {
+            val fut = list.map { c ->
+                pool.submit(Callable<Boolean> {
+                    val t = Net.peek(c, h, 4096)?.trimStart()
+                    t != null && t.startsWith("#EXTM3U") && t.contains("#EXT-X-STREAM-INF")
+                })
+            }
+            for (i in list.indices) {
+                val ok = try { fut[i].get(8, TimeUnit.SECONDS) } catch (e: Exception) { false }
+                if (ok) return list[i]
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+        return null
+    }
+
+    private val QUALITY_HEIGHTS = intArrayOf(144, 240, 360, 480, 540, 720, 1080, 1440, 2160)
+
+    /** جودات شقيقة لرابط مباشر يحمل رقم الجودة (مثل video_720.mp4): نفحص وجود الأرقام الأخرى */
+    private fun siblings(url: String, ext: String, h: Map<String, String>): List<Format> {
+        val noQuery = url.substringBefore('?')
+        val query = if (url.contains('?')) "?" + url.substringAfter('?') else ""
+        val slash = noQuery.indexOf('/', 8)
+        if (slash < 0) return emptyList()
+        val host = noQuery.substring(0, slash)
+        val path = noQuery.substring(slash)
+        val m = Regex("(?<=[/_.-])(\\d{3,4})(p?)(?=[/_.-]|$)").findAll(path)
+            .firstOrNull { (it.groupValues[1].toIntOrNull() ?: 0) in QUALITY_HEIGHTS } ?: return emptyList()
+        val cur = m.groupValues[1].toInt()
+        val suffix = m.groupValues[2]
+        val urls = QUALITY_HEIGHTS.filter { it != cur }.map { qh ->
+            val np = path.substring(0, m.range.first) + qh + suffix + path.substring(m.range.last + 1)
+            qh to (host + np + query)
+        }
+        val pool = Executors.newFixedThreadPool(4)
+        val out = ArrayList<Format>()
+        try {
+            val fut = urls.map { (qh, u) ->
+                pool.submit(Callable<Format?> {
+                    try {
+                        val p = Net.probe(u, h)
+                        if (p.total > 200_000 && !p.mime.startsWith("text/") && !p.mime.contains("html") && !p.mime.contains("json")) {
+                            Format(qualityLabel(qh * 16 / 9, qh), Util.host(u) + " • جودة إضافية", u, "direct", ext, false,
+                                Util.fmtSize(p.total), false, 0.0, p.total)
+                        } else null
+                    } catch (e: Exception) {
+                        null
+                    }
+                })
+            }
+            for (f in fut) {
+                val r = try { f.get(8, TimeUnit.SECONDS) } catch (e: Exception) { null }
+                if (r != null) out.add(r)
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+        return out
+    }
+
     fun resolve(item: MediaItem, h: Map<String, String>): List<Format> {
         val out = ArrayList<Format>()
         if (item.type == "hls") {
@@ -113,6 +196,12 @@ object Formats {
                     out.add(Format("صوت (" + a.name + ")", "", a.url, "hls", "ts", true, fmtEst(est), true, dur))
                 }
             } else {
+                // القائمة المطلوبة جودة واحدة فقط: نحاول إيجاد القائمة الرئيسية لعرض كل الجودات
+                val master = discoverMaster(item.url, h)
+                if (master != null) {
+                    val viaMaster = resolve(MediaItem(master, "hls"), h)
+                    if (viaMaster.isNotEmpty()) return viaMaster
+                }
                 val inf = mediaInfo(item.url, h, true)
                 val m0 = Hls.parseMedia(text, item.url)
                 val label = if (inf.h > 0) qualityLabel(inf.w, inf.h)
@@ -142,6 +231,7 @@ object Formats {
             d.add(Util.host(item.url))
             d.add(if (p.rangeOk) "يدعم التجزئة والاستئناف" else "بدون تجزئة/استئناف")
             out.add(Format(label, d.joinToString(" • "), item.url, "direct", ext, false, Util.fmtSize(p.total), audio, 0.0, p.total))
+            if (!audio) out.addAll(siblings(item.url, ext, h))
         }
         return out
     }

@@ -72,6 +72,30 @@ object Net {
         }
     }
 
+    /** يقرأ أول max بايت فقط (للتعرف السريع على نوع المحتوى)؛ يُرجع null عند الفشل */
+    fun peek(url: String, headers: Map<String, String>, max: Int): String? {
+        return try {
+            val c = connect(url, headers)
+            try {
+                if (c.responseCode !in 200..299) null
+                else c.inputStream.use { ins ->
+                    val buf = ByteArray(max)
+                    var n = 0
+                    while (n < max) {
+                        val r = ins.read(buf, n, max - n)
+                        if (r < 0) break
+                        n += r
+                    }
+                    String(buf, 0, n, Charsets.UTF_8)
+                }
+            } finally {
+                c.disconnect()
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     fun fetchText(url: String, headers: Map<String, String>): String {
         val c = connect(url, headers)
         try {
