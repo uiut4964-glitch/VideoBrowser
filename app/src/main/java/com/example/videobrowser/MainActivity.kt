@@ -207,6 +207,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         DownloadCenter.init(this)
+        AdBlock.init(this)
         defaultUa = WebSettings.getDefaultUserAgent(this).replace("; wv", "").replace(Regex(" Version/\\d+\\.\\d+"), "")
         desktop = Prefs.desktop(this)
         if (Build.VERSION.SDK_INT >= 33 &&
@@ -555,6 +556,10 @@ class MainActivity : AppCompatActivity() {
 
             override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest): WebResourceResponse? {
                 val u = r.url.toString()
+                // حجب نطاقات الإعلانات والتتبع (لا نحجب تنقّل الصفحة الرئيسية نفسها)
+                if (!r.isForMainFrame && Prefs.adblock(this@MainActivity) && AdBlock.isBlocked(r.url.host)) {
+                    return WebResourceResponse("text/plain", "UTF-8", java.io.ByteArrayInputStream(ByteArray(0)))
+                }
                 if (MEDIA_REGEX.containsMatchIn(u) || u.contains("videoplayback")) {
                     ui.post { tabOf(v)?.let { rec(it, u) } }
                 }

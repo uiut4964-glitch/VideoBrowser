@@ -145,6 +145,22 @@ class SettingsActivity : AppCompatActivity() {
 
         add("تشخيص: سبب آخر إغلاق للتطبيق", "اضغط لعرض السبب") { showExitReason() }
 
+        add("حجب الإعلانات", onOff(Prefs.adblock(this)) + " — " + AdBlock.count() + " نطاق (اضغط لتبديل الحالة)") {
+            AlertDialog.Builder(this).setTitle("حجب الإعلانات")
+                .setItems(arrayOf(if (Prefs.adblock(this)) "إيقاف الحجب" else "تفعيل الحجب", "تحديث القائمة من الإنترنت")) { _, i ->
+                    if (i == 0) {
+                        Prefs.setAdblock(this, !Prefs.adblock(this)); render()
+                    } else {
+                        Toast.makeText(this, "جارٍ تحديث القائمة...", Toast.LENGTH_SHORT).show()
+                        AdBlock.updateAsync(this) { n ->
+                            Toast.makeText(this, if (n > 0) "تم التحديث: " + n + " نطاق" else "تعذّر التحديث (تحقق من الإنترنت)", Toast.LENGTH_LONG).show()
+                            render()
+                        }
+                    }
+                }
+                .setNegativeButton("إلغاء", null).show()
+        }
+
         add("مسح السجل", "حذف سجل التصفح") {
             Store.put(this, "history", emptyList())
             Toast.makeText(this, "تم مسح السجل", Toast.LENGTH_SHORT).show()

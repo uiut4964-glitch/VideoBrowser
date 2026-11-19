@@ -30,6 +30,9 @@ object Prefs {
     fun desktop(c: Context): Boolean = sp(c).getBoolean("desktop", false)
     fun setDesktop(c: Context, v: Boolean) { sp(c).edit().putBoolean("desktop", v).apply() }
 
+    fun adblock(c: Context): Boolean = sp(c).getBoolean("adblock", true)
+    fun setAdblock(c: Context, v: Boolean) { sp(c).edit().putBoolean("adblock", v).apply() }
+
     fun wifiOnly(c: Context): Boolean = sp(c).getBoolean("wifi", false)
     fun setWifiOnly(c: Context, v: Boolean) { sp(c).edit().putBoolean("wifi", v).apply() }
 }
